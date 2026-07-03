@@ -3,4 +3,5 @@
 *.pdb
 *.ilk
 *.log
+*.o
 .vs/
