@@ -1,0 +1,124 @@
+\begin{thebibliography}{10}
+\expandafter\ifx\csname url\endcsname\relax
+  \def\url#1{\texttt{#1}}\fi
+\expandafter\ifx\csname urlprefix\endcsname\relax\def\urlprefix{URL }\fi
+\expandafter\ifx\csname href\endcsname\relax
+  \def\href#1#2{#2} \def\path#1{#1}\fi
+
+\bibitem{edge-survey}
+Z.~Wang, S.~Zhuang, Z.~Wang, L.~Liu, A survey of {LLM} inference on edge
+  devices, arXiv preprint arXiv:2501.00001 (2025).
+
+\bibitem{eagle2024}
+Y.~Li, F.~Wei, C.~Zhang, H.~Zhang, {Eagle}: Speculative sampling needs
+  rethinking, in: arXiv preprint arXiv:2401.15077, 2024.
+
+\bibitem{staged-spec}
+B.~Spector, S.~Arora, R.~Pope, C.~Fifty, D.~Song, Staged speculative decoding,
+  in: Proceedings of the 13th International Conference on Learning
+  Representations (ICLR), 2025.
+
+\bibitem{medusa2024}
+T.~Cai, Y.~Li, Z.~Geng, H.~Peng, J.~D. Lee, D.~Chen, T.~Dao, {Medusa}: Simple
+  {LLM} inference acceleration framework with multiple decoding heads, arXiv
+  preprint arXiv:2401.10774 (2024).
+
+\bibitem{sharegpt}
+L.~Zheng, W.-L. Chiang, Y.~Sheng, S.~Zhuang, Z.~Wu, Y.~Zhuang, Z.~Lin, Z.~Li,
+  D.~Li, E.~P. Xing, H.~Zhang, J.~E. Gonzalez, I.~Stoica, Judging
+  {LLM}-as-a-{Judge} with {MT}-bench and {Chatbot} {Arena},
+  \url{https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered}
+  (2023).
+
+\bibitem{gqa}
+J.~Ainslie, J.~Lee-Thorp, M.~de~Jong, Y.~Zemlyanskiy, F.~Lebron, S.~Sanghai,
+  {GQA}: Training generalized multi-query transformer models from multi-head
+  checkpoints, in: Proceedings of the 2023 Conference on Empirical Methods in
+  Natural Language Processing (EMNLP), 2023.
+
+\bibitem{leviathan2023}
+Y.~Leviathan, M.~Kalman, Y.~Matias, Fast inference from transformers via
+  speculative decoding, in: Proceedings of the 40th International Conference on
+  Machine Learning (ICML), 2023.
+
+\bibitem{specdec2023}
+C.~Chen, S.~Borgeaud, G.~Irving, J.-B. Lespiau, L.~Sifre, J.~Jumper,
+  Accelerating large language model decoding with speculative sampling, in:
+  Proceedings of the 40th International Conference on Machine Learning (ICML),
+  2023.
+
+\bibitem{vllm2023}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~Yu, J.~E. Gonzalez, H.~Zhang,
+  I.~Stoica, Efficient memory management for large language model serving with
+  {PagedAttention}, in: Proceedings of the 29th ACM Symposium on Operating
+  Systems Principles (SOSP), 2023.
+
+\bibitem{lmcache2025}
+Y.~Cheng, Y.~Liu, J.~Yao, Y.~An, X.~Chen, S.~Feng, Y.~Huang, S.~Shen, K.~Du,
+  J.~Jiang, {LMCache}: An efficient {KV} cache layer for enterprise-scale {LLM}
+  inference, arXiv preprint arXiv:2510.09665 (2025).
+
+\bibitem{shadowkv2025}
+H.~Sun, L.~Yin, Z.~Liu, Z.~Jia, {ShadowKV}: {KV} cache in {Low-Rank} space for
+  high-throughput long-context {LLM} inference, in: Proceedings of the 42nd
+  International Conference on Machine Learning (ICML), 2025, spotlight.
+
+\bibitem{kvquant2024}
+C.~Hooper, S.~Kim, H.~Mohammadzadeh, M.~W. Mahoney, Y.~S. Shao, K.~Keutzer,
+  A.~Gholami, {KVQuant}: Towards 10-million context length {LLM} inference with
+  {KV} cache quantization, arXiv preprint arXiv:2401.18079 (2024).
+
+\bibitem{gpu-nondet}
+N.~Corporation, Reproducibility in {CUDA}: {CUBLAS} deterministic,
+  \url{https://docs.nvidia.com/cuda/cublas/index.html#cublas-deterministic}
+  (2024).
+
+\bibitem{quantspec2025}
+R.~Tiwari, H.~Xi, A.~Tomar, C.~Hooper, S.~Kim, M.~Horton, M.~Najibi, M.~W.
+  Mahoney, K.~Keutzer, A.~Gholami, {QuantSpec}: Self-speculative decoding with
+  hierarchical quantized {KV} cache, in: Proceedings of the 42nd International
+  Conference on Machine Learning (ICML), 2025.
+
+\bibitem{arc2003}
+N.~Megiddo, D.~S. Modha, Arc: A self-tuning, low overhead replacement cache,
+  in: Proceedings of the 2nd USENIX Conference on File and Storage Technologies
+  (FAST), 2003, pp. 115--130.
+
+\bibitem{icarus2026}
+R.~Fan, X.~Yu, P.~Dong, W.~Wang, X.~Chu, {ICaRus}: Multi-model {KV} cache
+  sharing via fine-tuning, in: Proceedings of the 14th International Conference
+  on Learning Representations (ICLR), 2026.
+
+\bibitem{droidspeak2026}
+H.~He, J.~Gu, Y.~Qiao, M.~Liu, Z.~Wang, {DroidSpeak}: {KV} cache sharing across
+  fine-tuned model variants, in: Proceedings of the 21st USENIX Symposium on
+  Networked Systems Design and Implementation (NSDI), 2026.
+
+\bibitem{polykv2026}
+B.~Zhao, Q.~Wu, Z.~Chen, Z.~Ji, Y.~Wu, L.~Liu, {PolyKV}: A shared
+  asymmetrically-compressed {KV} cache pool for multi-agent {LLM} inference,
+  arXiv preprint arXiv:2604.24971 (2026).
+
+\bibitem{tokendance2026}
+Z.~Zhang, C.~Li, S.~Cao, Y.~Wu, {TokenDance}: Scaling multi-agent {LLM} serving
+  via collective {KV} cache sharing, arXiv preprint arXiv:2604.03143 (2026).
+
+\bibitem{forkkv2026}
+Z.~Wang, Y.~Wu, H.~Wu, {ForkKV}: Scaling multi-{Lora} agent serving via
+  copy-on-write disaggregated {KV} cache, arXiv preprint arXiv:2604.06370
+  (2026).
+
+\bibitem{flexgen2022}
+Y.~Sheng, L.~Zheng, B.~Yuan, Z.~Li, M.~Ryabinin, D.~Y. Fu, Z.~Xie, B.~Chen,
+  C.~Barrett, J.~E. Gonzalez, P.~Liang, C.~R\'{e}, I.~Stoica, C.~Zhang,
+  Flexgen: High-throughput generative inference of large language models with a
+  single {GPU}, in: Proceedings of the 40th International Conference on Machine
+  Learning (ICML), 2023.
+
+\bibitem{powerinfer2024}
+Y.~Lee, D.~Kim, J.~Lee, M.~Rhu, {PowerInfer}: Fast large language model serving
+  with {Power} consumption constraints, in: Proceedings of the 31st ACM
+  International Conference on Architectural Support for Programming Languages
+  and Operating Systems (ASPLOS), 2024.
+
+\end{thebibliography}

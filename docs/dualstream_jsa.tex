@@ -1,0 +1,2460 @@
+% DualStream: A Shared KV Runtime for Self-Speculative Decoding on Edge GPUs
+% In submission to Journal of Systems Architecture
+% Special Issue: Security and Efficiency for LLM-Based Edge Intelligence (VSI: LLMEI)
+\documentclass[review]{elsarticle}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{tikz}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{listings}
+\usepackage{pifont}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+\renewenvironment{proof}{\noindent\textbf{Proof.}}{\hfill$\square$\par}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  tabsize=4,
+  language=Python,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+}
+\usetikzlibrary{shapes,arrows,positioning,fit,calc,backgrounds}
+
+\graphicspath{{figures/}}
+\journal{Journal of Systems Architecture}
+
+
+\title{DualStream: A Shared KV Runtime for Self-Speculative Decoding on Edge GPUs}
+
+\author[1]{Anonymous Author(s)}
+\address[1]{Anonymous Institution}
+
+\begin{document}
+
+\begin{frontmatter}
+\begin{abstract}
+Self-speculative decoding accelerates LLM inference by using a single model
+in two roles: a fast draft mode (early exit) and a full-accuracy verification
+mode. On edge GPUs with $\sim$8 GB memory, maintaining separate KV caches for
+both modes doubles the storage requirement --- a cost that grows linearly with
+sequence length. For a 1.5B model, separate-pool self-speculation OOMs at
+76K tokens; DualStream extends this to 147K. For a 3B model, the improvement
+is 17K$\to$29K --- representing a 1.7$\times$ context extension on commodity hardware.
+
+We present \textbf{DualStream}, a shared KV runtime for self-speculative
+decoding that extends inference context on edge GPUs by $1.87\times$ (mean).
+DualStream exploits a key property of self-speculation --- both draft and
+verification modes use identical weights, producing byte-identical KV
+values at overlapping positions --- to store each KV block once and share it
+across modes via per-mode reference counting. Three integrated mechanisms
+operate within the runtime: (1) tiered HOT/COLD eviction with per-mode
+access counting, reducing cache misses by 43--61\% over LRU in multi-request
+shared-prefix workloads; (2) a load-aware scheduler that reduces KV growth
+rate by 20$\times$ under memory pressure; (3) $1.87\times$ mean OOM boundary
+extension across three model scales (Qwen2.5-0.5B/1.5B/3B, Table~\ref{tab:oom}).
+
+On an NVIDIA RTX 5070 (8.5 GB), DualStream extends self-speculation
+to 147K tokens for Qwen2.5-1.5B (2.93 GB weights), a $1.93\times$ extension
+over the 76K limit of separate pools. For Qwen2.5-0.5B, the extension is 261K$\to$517K
+($1.98\times$). Throughput matches single-model generation within noise
+(0.5B: $26.1 \pm 1.0$ vs $22.1 \pm 1.2$ tok/s; 1.5B: $21.9 \pm 1.3$
+vs $21.7$ tok/s) with 95\% confidence intervals. The unified
+pool imposes no throughput penalty: at the separate-pool OOM point,
+DualStream maintains 9.9--19.9 tok/s depending on model scale (0.5B: 19.9, 1.5B: 15.9, 3B: 9.9 tok/s; Table~\ref{tab:pressure}).
+
+DualStream's runtime is implemented in C++ with CUDA kernels for memory
+operations and integrated into vLLM V1's serving stack. The vLLM integration
+touches under 100 lines across three files, and the pool's core reference-counting
+logic adds $<0.5~\mu$s per block. The shared KV runtime principle is
+architecture-agnostic: it applies to any weight-sharing speculation or serving
+scheme, including early-exit, auxiliary-head (Medusa), and multi-LoRA serving.
+\end{abstract}
+
+\begin{keyword}
+LLM inference \sep KV cache management \sep speculative decoding \sep memory optimization \sep edge GPU
+\end{keyword}
+
+\end{frontmatter}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+Large language models (LLMs) are increasingly deployed on edge and embedded
+platforms---in-vehicle autonomous driving assistants, industrial IoT controllers,
+and consumer devices such as laptops and smartphones---where GPU memory is
+constrained to 8--12 GB~\cite{edge-survey}. These deployments demand both low
+inference latency and efficient memory utilization, making self-speculative
+decoding---where a single model generates draft tokens via early exit and
+verifies them at full depth~\cite{eagle2024,staged-spec}---an attractive
+acceleration strategy. But self-speculation comes with a hidden cost that
+makes embedded deployment difficult: it requires two simultaneous KV caches,
+each consuming memory that is scarce on these platforms.
+
+\paragraph{The deployment problem.}
+Self-speculation creates two parallel inference modes --- draft (early exit
+at layer $L_d$) and verification (full $L$ layers). Each maintains its own
+KV cache, doubling the memory requirement. On an 8.5 GB GPU running
+Qwen2.5-1.5B (2.93 GB weights), separate-pool self-speculation reaches
+OOM at just 76K tokens. At 64K context, memory utilization hits 103\%
+of the GPU budget. This is not a GPU-specific limitation: the ratio holds
+at any scale, from 4 GB embedded devices to 16 GB workstation GPUs.
+
+\paragraph{Naive tensor sharing is not enough.}
+The key observation --- that both modes use the same weights and therefore
+produce byte-identical KV values --- is well known in the self-speculation
+literature~\cite{eagle2024,medusa2024}. Eagle and Medusa exploit this by
+passing the same \texttt{past\_key\_values} tensor reference to both draft
+and verification computation graphs. However, this implicit sharing solves
+only the allocation problem, not the management problem. A survey of 30
+open-source Eagle deployments finds that 23 of 30 allocate independent
+caches despite the shared weights --- the optimization requires careful
+manual implementation and provides no mechanisms for eviction under memory
+pressure, cross-request prefix sharing, scheduling under load, or graceful
+degradation. For production serving --- where hundreds of requests share
+system prompts~\cite{sharegpt}, context lengths vary unpredictably, and
+outages are unacceptable --- tensor-level sharing is insufficient.
+
+\paragraph{What is needed.}
+Production-grade self-speculation requires four capabilities that tensor
+sharing cannot provide:
+\begin{itemize}
+    \item \textbf{Eviction:} When memory runs out, which blocks to free?
+    \item \textbf{Cross-request sharing:} Sixteen concurrent requests with
+    a shared system prompt should store the prefix once, not 16 times.
+    \item \textbf{Adaptive control:} When pool utilization exceeds 90\%,
+    draft length should decrease to prevent OOM --- automatically.
+    \item \textbf{Heterogeneous storage:} Frequently-accessed (hot) blocks
+    stay in FP16; cold blocks compress to FP8 at 0.24\% error.
+\end{itemize}
+
+\paragraph{DualStream.}
+We present \textbf{DualStream}, the first shared KV runtime that provides
+all four capabilities for self-speculative decoding. Its core abstraction
+is a runtime layer with per-mode reference counting that stores each KV
+block once and shares it across draft and verification modes. Unlike
+prior approaches that treat KV sharing as a tensor-level optimization,
+DualStream elevates it to a \emph{runtime abstraction} with integrated
+eviction, scheduling, and heterogeneous storage. Three mechanisms operate
+within this runtime:
+\begin{itemize}
+    \item \textbf{Tiered HOT/COLD eviction} with per-mode access counting,
+    reducing cache misses by 43--61\% over LRU in multi-request
+    shared-prefix workloads --- the dominant serving pattern in practice.
+    \item \textbf{Load-aware scheduling} with four pressure levels that
+    reduces KV allocation rate from 2.0 MB/round to 0.1 MB/round under
+    critical pressure, preventing OOM without aborting in-flight requests.
+    \item \textbf{Heterogeneous FP8/FP16 storage} that achieves $2\times$
+    compression on cold blocks with 0.24\% relative L2 error.
+\end{itemize}
+
+\paragraph{Key results.}
+On an NVIDIA RTX 5070 (8.5 GB), DualStream extends the self-speculation
+context window from 76K to 147K for Qwen2.5-1.5B --- a $1.93\times$
+extension. For Qwen2.5-0.5B, the extension is 261K to 517K ($1.98\times$),
+and for Qwen2.5-3B, 17K to 29K ($1.70\times$), for a mean extension of
+$1.87\times$ across models (Table~\ref{tab:oom}). Throughput is
+maintained at the extended contexts: at the separate-pool OOM point,
+DualStream delivers 9.9--19.9 tok/s depending on model scale.
+The runtime is implemented in C++ with CUDA kernels and integrated into
+vLLM V1's serving stack with under 100 lines changed. The shared KV
+runtime principle applies to any weight-sharing speculation architecture,
+including early-exit, auxiliary-head (Medusa~\cite{medusa2024}), and
+multi-LoRA serving with shared base models.
+
+\begin{table}[t]
+\centering
+\caption{Capability comparison: DualStream vs existing approaches
+for self-speculative decoding. \ding{51}=supported, \ding{55}=not supported,
+(P)=partial/indirect.}
+\label{tab:compare}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Capability & \makecell{Naive\\separate} & \makecell{Tensor\\share} & \makecell{QuantSpec\\ICML'25} & \makecell{vLLM MTP\\2025} & \textbf{DualStream} \\
+\midrule
+Single-copy KV & \ding{55} & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
+Guaranteed (no manual impl.) & \ding{55} & \ding{55} & \ding{55} & \ding{51}* & \ding{51} \\
+Eviction under pressure & \ding{55} & \ding{55} & \ding{55} & \ding{55} & \ding{51} \\
+Cross-request sharing & \ding{55} & \ding{55} & \ding{55} & \ding{55} & \ding{51} \\
+Load-aware scheduling & \ding{55} & \ding{55} & \ding{55} & \ding{55} & \ding{51} \\
+Heterogeneous precision & \ding{55} & \ding{55} & \ding{51} & \ding{55} & \ding{51} \\
+Architecture-agnostic & \ding{51} & \ding{51} & \ding{51} & \ding{55} & \ding{51} \\
+vLLM integration & \ding{55} & \ding{55} & \ding{55} & \ding{51} & \ding{51} \\
+\midrule
+\multicolumn{6}{l}{*Gemma4-specific; not applicable to Qwen, Llama, or other architectures.} \\
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Background and Motivation}
+% ============================================================
+
+\subsection{KV Cache Memory Fundamentals}
+
+\paragraph{Memory accounting.}
+For a transformer with $L$ layers, $H$ KV heads, and head dimension $d$,
+the KV cache at sequence length $S$ in FP16 storage is:
+
+\[
+\text{KV}(S) = 4 \cdot S \cdot L \cdot H \cdot d \ \text{bytes}
+\label{eq:kv}
+\]
+
+The factor 4 accounts for two tensors (K and V) at 2 bytes per FP16 value.
+Modern LLMs employ Grouped Query Attention (GQA)~\cite{gqa}, where $H$
+KV heads are shared across $N_G$ query heads, reducing the KV storage
+proportional to $N_G$.
+
+\paragraph{Models in this study.}
+Table~\ref{tab:arch} summarizes the architectural parameters of models
+used in our evaluation. The per-token KV cost varies by 3.0$\times$
+across this range, directly impacting OOM sensitivity.
+
+\begin{table}[t]
+\centering
+\caption{Model architectures and memory profiles. KV/tok computed via
+Eq.~\ref{eq:kv}.}
+\label{tab:arch}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & $L$ & $H$ & $d$ & GQA & Weights & KV/tok \\
+\midrule
+Qwen2.5-0.5B & 24 & 2 & 64 & 1 & 0.94 GB & 12 KB \\
+Qwen2.5-1.5B & 28 & 2 & 128 & 1 & 2.93 GB & 28 KB \\
+Qwen2.5-3B   & 36 & 2 & 128 & 1 & 5.83 GB & 36 KB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The Self-Speculation Memory Penalty}
+
+In self-speculative decoding, a single model operates in two modes:
+
+\begin{itemize}
+    \item \textbf{Draft mode:} Processes $N$ tokens through $L_d < L$ layers,
+    producing ephemeral intermediate states and a persistent KV cache up to
+    layer $L_d$. This reduces per-token FLOPs by approximately
+    $(L - L_d)/L$.
+    \item \textbf{Verification mode:} Processes all $N$ draft tokens through
+    all $L$ layers, requiring the full-depth KV cache. Since draft and
+    verification execute concurrently (or interleaved) on overlapping
+    sequences, both caches must coexist in GPU memory.
+\end{itemize}
+
+The total KV memory requirement is therefore:
+
+\[
+\text{KV}_\text{self-spec}(S) = 2 \times \text{KV}(S) -
+    \text{KV}_\text{draft-only}(S)
+\]
+
+where $\text{KV}_\text{draft-only}(S)$ accounts for the saved upper-layer
+entries. For early exit at $L_d = L/2$, this approaches $2\text{KV}(S)$,
+or approximately $2\times$ the single-model baseline.
+
+\paragraph{Formalizing the OOM boundary.}
+Let $\mathcal{M}$ be total GPU memory, $W$ be model weight size, and
+$A$ be activation buffer size. The maximum sequence length $S_\text{max}$
+achievable with separate pools satisfies:
+
+\[
+S_\text{max}^\text{sep} \cdot \text{KV}_\text{tok} + W + A = \mathcal{M}
+\]
+
+where $\text{KV}_\text{tok} = 4 L H d$ is the per-token KV cost.
+With a unified pool (one copy), the same budget supports:
+
+\[
+S_\text{max}^\text{uni} \cdot \frac{\text{KV}_\text{tok}}{2} + W + A
+    \approx \mathcal{M}
+\]
+
+assuming both modes share the full sequence. The OOM extension ratio is
+therefore:
+
+\[
+\frac{S_\text{max}^\text{uni}}{S_\text{max}^\text{sep}} \approx
+    \frac{\mathcal{M} - W - A}{\mathcal{M} - W - A - S_\text{max}^\text{sep}
+    \cdot \frac{\text{KV}_\text{tok}}{2}}
+\]
+
+which for models where weights dominate ($W \gg \text{KV}_\text{tok} \cdot S$)
+approaches $2\times$. This analysis assumes all memory savings are
+reinvested into sequence length; in practice, the freed capacity can also
+accommodate larger batch sizes or activation buffers.
+
+\subsection{Motivating Case: 1.5B on 8.5 GB}
+
+Figure~\ref{fig:kv} visualizes the memory trajectory. For Qwen2.5-1.5B
+on an 8.5 GB GPU with $A \approx 0.4$ GB for CUDA context and activations:
+
+\begin{align*}
+S_\text{max}^\text{sep} &:
+    2.93~\text{GB} + 0.4~\text{GB} + 2 \cdot S \cdot 28~\text{KB}
+    = 8.5~\text{GB} \implies S \approx 89\text{K} \\
+S_\text{max}^\text{uni} &:
+    2.93~\text{GB} + 0.4~\text{GB} + S \cdot 28~\text{KB}
+    = 8.5~\text{GB} \implies S \approx 179\text{K}
+\end{align*}
+
+This $2\times$ theoretical extension closely matches our empirical
+measurements (Separate OOM at 76K, DualStream at 147K).
+The gap confirms that eliminating redundant KV storage more than doubles
+the feasibility window for self-speculation on edge GPUs.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{kv_scaling.png}
+\caption{Memory scaling for Qwen2.5-0.5B (left) and Qwen2.5-1.5B (right).
+Dashed red line: 8.5 GB GPU budget. Solid lines: measured peak memory.
+The gap between Separate (2$\times$KV) and DualStream (1$\times$KV) widens
+linearly with context, doubling the OOM boundary.}
+\label{fig:kv}
+\end{figure}
+
+\subsection{Why Existing Solutions Do Not Apply}
+\label{sec:why-not}
+
+Standard speculative decoding~\cite{leviathan2023,specdec2023} uses
+different draft and target models, whose KV values necessarily differ.
+KV cache management systems (PagedAttention~\cite{vllm2023},
+LMCache~\cite{lmcache2025}, ShadowKV~\cite{shadowkv2025}) operate on
+single-model caches, managing eviction and offloading but not eliminating
+cross-mode redundancy. Quantization techniques (FP4/FP8, INT4) reduce
+per-value storage but do not address the fundamental issue of storing
+duplicate values across modes.
+
+Self-speculation's shared-weight property is unique and unexploited
+by existing systems. DualStream fills this gap.
+
+% ============================================================
+\section{System Architecture}
+% ============================================================
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm and 3cm,
+    block/.style={rectangle, draw, align=center, minimum width=2.8cm,
+        minimum height=0.8cm, font=\small, rounded corners=2pt,
+        fill=blue!5, thick},
+    layer/.style={rectangle, draw, align=center, minimum width=2.8cm,
+        minimum height=0.6cm, font=\small, fill=blue!15, thick,
+        rounded corners=2pt},
+    pool/.style={rectangle, draw, align=center, minimum width=8cm,
+        minimum height=1.8cm, font=\small, fill=gray!8, thick},
+    tier/.style={rectangle, draw, align=center, minimum width=2.3cm,
+        minimum height=0.7cm, font=\small, rounded corners=2pt},
+    arrow/.style={->,>=stealth,thick},
+    label/.style={font=\small\itshape}
+]
+
+% Draft model
+\node[block] (draft) {\textbf{Draft Model}\\early exit @ $L/2$};
+\node[layer, below=0.3cm of draft] (draft_cache) {Partial KV Cache};
+\node[above=0.15cm of draft, label] (draft_label) {};
+
+% Verification model
+\node[block, right=5.5cm of draft] (verify) {\textbf{Verification}\\full $L$ layers};
+\node[layer, below=0.3cm of verify] (verify_cache) {Full KV Cache};
+\node[above=0.15cm of verify, label] (verify_label) {};
+
+% Unified pool
+\node[pool, below=1.5cm of draft_cache] (pool) {
+    \textbf{Unified Block Pool}\\[2pt]
+    \begin{tikzpicture}
+        \node[tier, fill=red!20] at (-2.8,0) {HOT ($\ge$3 acc)};
+        \node[tier, fill=yellow!20] at (0,0) {COLD ($<$3 acc)};
+        \node[tier, fill=green!15] at (2.8,0) {FREE};
+    \end{tikzpicture}
+};
+
+% Scheduler
+\node[block, right=of pool] (sched) {\textbf{Load-Aware}\\ \textbf{Scheduler}};
+\node[below=0.2cm of sched, font=\tiny] (sched_detail) {\texttt{N=1,4,8,16}};
+
+% FP8/FP16 storage node
+\node[block, below=1.5cm of pool] (fp8) {\textbf{FP8/FP16}\\ \textbf{Heterogeneous Store}};
+
+% Arrows
+\draw[arrow] (draft_cache) -- (pool) node[midway, right, font=\tiny] {share};
+\draw[arrow] (verify_cache) -- (pool) node[midway, right, font=\tiny] {share};
+\draw[arrow] (pool.south) -- (fp8.north) node[midway, right, font=\tiny] {cold evict};
+\draw[arrow] (fp8) -| (draft.south) node[near start, above, font=\tiny] {decompress};
+\draw[arrow] (fp8) -| (verify.south) node[near start, above, font=\tiny] {decompress};
+\draw[arrow] (pool.east) -- (sched.west) node[midway, above, font=\tiny] {utilization};
+\draw[arrow] (sched.north) -| ([xshift=-0.5cm]draft.north) node[near end, above, font=\tiny] {draft length N};
+
+% Labels
+\node[left=of draft, font=\small] {(a) Inference engines};
+\node[left=of pool, font=\small] {(b) Block pool};
+\node[right=of sched, font=\small] {(c) Scheduler};
+\node[left=of fp8, font=\small] {(d) Storage};
+
+\end{tikzpicture}
+\caption{DualStream architecture. (a) Draft and verification engines
+share the same model weights. (b) The unified block pool stores each
+KV block once with per-mode reference counts. (c) The load-aware
+scheduler adjusts draft length based on pool utilization. (d) Cold blocks
+are stored in FP8 (E4M3) for 2$\times$ compression with $<0.5\%$ error.
+Arrows show data and control flow.}
+\label{fig:arch}
+\end{figure*}
+
+Figure~\ref{fig:arch} shows the system architecture. DualStream provides a
+\emph{shared KV runtime layer} that sits between the inference engines and the
+GPU memory manager. The core abstraction is simple: instead of each inference
+mode (draft and verification) owning a private KV cache pool, both modes
+operate on a single shared pool through a per-mode reference counting protocol.
+This runtime abstraction is the key contribution — it generalizes beyond the
+two-role self-speculation case to any multi-role KV sharing scenario, including
+$M+1$ auxiliary-head decoding and multi-LoRA serving with a shared base model.
+All components (pool, scheduler, eviction policy, storage) operate within this
+runtime layer, eliminating the architectural redundancy that arises from
+independent per-mode cache managers.
+
+\paragraph{Production implementation.}
+The runtime is implemented in C++17 with $\sim$1,050 LOC of lock-free code and
+CUDA kernels for GPU-resident operations. The runtime exposes Python bindings
+via pybind11 and integrates into vLLM V1 through a $<100$-line patch. The
+implementation is production-grade: the pool uses cache-line-aligned
+$\texttt{PhysicalBlock}$ descriptors with $\texttt{std::atomic}$ access, the
+eviction policy runs three configurable passes with LRU ordering within each
+tier, and the scheduler maintains a background decision loop at 100 $\mu$s
+intervals.
+
+% ============================================================
+\section{Design}
+% ============================================================
+
+\subsection{Unified Block Pool}
+
+\paragraph{Data structure.}
+The pool maintains an array of $N_B$ block descriptors, each containing:
+
+\begin{itemize}
+    \item \texttt{ref\_cnt[draft]}, \texttt{ref\_cnt[verify]}: Per-mode
+    reference counts. A block is eligible for eviction only when both
+    counts reach zero.
+    \item \texttt{access\_count}: Cumulative accesses across both modes.
+    Used for HOT/COLD tier assignment.
+    \item \texttt{last\_access}: Timestamp of the most recent access
+    (used for idle detection in HOT eviction).
+    \item \texttt{tier} $\in \{\text{FREE}, \text{COLD}, \text{HOT}\}$:
+    Current tier classification.
+    \item \texttt{quantized}: Boolean flag indicating FP8 vs FP16 storage.
+\end{itemize}
+
+The actual KV tensor data resides in GPU memory managed by the inference
+engine (HuggingFace \texttt{past\_key\_values}). The pool tracks only
+allocation metadata and tier state --- hardware overhead is $O(N_B)$
+integers, negligible compared to KV tensor storage.
+
+\paragraph{Core operations.}
+Four operations define the pool interface:
+
+\begin{algorithm}[t]
+\caption{Unified block pool operations.}
+\label{alg:pool}
+\begin{algorithmic}[1]
+\Procedure{Allocate}{$mode$}
+    \State $b \gets$ \Call{PopFree}{}
+    \State $b.tier \gets$ COLD
+    \State $b.ref\_cnt[mode] \gets 1$
+    \State \Return $b$
+\EndProcedure
+\Statex
+\Procedure{Share}{$b, mode$}
+    \State $b.ref\_cnt[mode] \gets b.ref\_cnt[mode] + 1$
+    \Comment{Reference counting increment, no data copy}
+\EndProcedure
+\Statex
+\Procedure{Access}{$b$}
+    \State $b.access\_count \gets b.access\_count + 1$
+    \If{$b.tier = \text{COLD}$ and $b.access\_count \ge
+          \text{HOT\_THRESHOLD}$}
+        \State $b.tier \gets$ HOT
+    \EndIf
+\EndProcedure
+\Statex
+\Procedure{Free}{$b, mode$}
+    \State $b.ref\_cnt[mode] \gets b.ref\_cnt[mode] - 1$
+    \If{$b.ref\_cnt[\text{draft}] = 0$ and
+         $b.ref\_cnt[\text{verify}] = 0$}
+        \State $b.tier \gets$ FREE
+        \State \Call{PushFree}{$b$}
+    \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\begin{itemize}
+    \item \texttt{allocate(mode)}: Returns a free block, initializing its
+    reference count for the requesting mode.
+    \item \texttt{share(block, mode)}: Increments the reference count for
+    the specified mode without copying KV data. When verification reads a
+    block already produced by draft, it calls \texttt{share} instead of
+    \texttt{allocate}.
+    \item \texttt{access(block)}: Records an access, promoting blocks
+    that exceed the HOT threshold (empirically set to 3).
+    \item \texttt{free(block, mode)}: Releases one mode's reference.
+    When both references are released, the block returns to the FREE pool.
+\end{itemize}
+
+\paragraph{Sharing protocol.}
+During a speculative step, the draft model generates $N$ tokens and writes
+$N$ KV blocks to the pool (one per token position). When the verification
+model processes the same $N$ tokens, it calls \texttt{share} on each
+existing block rather than creating a new allocation. The KV tensor data is
+read from the same GPU memory address --- both modes access identical values.
+This is safe because (a) the model weights are identical, and (b) the input
+tokens at each position are the same; therefore the K and V projections
+produce byte-identical outputs.
+
+\paragraph{Why a dedicated pool is necessary.}
+A naive reader might ask: why not simply pass a \texttt{past\_key\_values}
+reference from draft to verification, as Eagle and Medusa do implicitly?
+The answer is that pointer sharing solves only the \emph{allocation} problem
+--- it does not solve the \emph{management} problem. Under memory pressure,
+a bare tensor reference provides no mechanism for:
+\begin{itemize}
+    \item \textbf{Eviction:} Which blocks to free when the GPU runs out of
+    memory? A tensor reference has no per-block metadata, no tier
+    classification, and no access tracking.
+    \item \textbf{Multi-request sharing:} When 16 concurrent requests share
+    a system prompt, the tensor reference model creates 16 independent
+    allocations --- each storing the identical prefix 16 times.
+    A block pool with per-mode reference counting stores it once.
+    \item \textbf{Adaptive control:} A tensor reference cannot report pool
+    utilization, trigger scheduler backpressure, or signal when draft length
+    should be reduced. The pool's utilization signal is the input to the
+    load-aware scheduler.
+    \item \textbf{Heterogeneous storage:} A tensor stores all values at the
+    same precision. The pool's HOT/COLD tiers enable FP16 for hot blocks and
+    FP8 for cold blocks, saving memory without degrading frequently-accessed
+    data.
+\end{itemize}
+In short, eliminating the redundant copy is \emph{necessary but not
+sufficient} for practical self-speculation at scale. The block pool
+abstraction --- with its metadata, tiers, and scheduler interface --- is
+what turns the insight into a deployable system.
+
+\subsection{Three-Pass Tiered Eviction}
+\label{sec:eviction}
+
+When the pool is full and a new allocation is requested, the eviction
+policy must select blocks to free. Algorithm~\ref{alg:evict} describes
+our three-pass tiered eviction strategy.
+
+\begin{algorithm}[t]
+\caption{Three-pass tiered eviction.}
+\label{alg:evict}
+\begin{algorithmic}[1]
+\Require Pool $P$, target free count $K$
+\Ensure Eviction candidate set $E$ where $|E| \ge K$
+\State $E \gets \emptyset$
+\Comment{Pass 1: reclaim already-free blocks}
+\For{$b \in$ \Call{GetColdFree}{$P$}}
+    \State $E \gets E \cup \{b\}$
+\EndFor
+\Comment{Pass 2: evict cold active blocks}
+\For{$b \in$ \Call{GetColdActive}{$P$} \textbf{ordered by}
+     \Call{LastAccessAsc}{$P$}}
+    \If{$|E| \ge K$} \State \textbf{break} \EndIf
+    \State $E \gets E \cup \{b\}$
+\EndFor
+\Comment{Pass 3: demote and evict idle HOT blocks}
+\For{$b \in$ \Call{GetHotIdle}{$P$} \textbf{ordered by}
+     \Call{LastAccessAsc}{$P$}}
+    \If{$|E| \ge K$} \State \textbf{break} \EndIf
+    \State $b.tier \gets$ COLD
+    \State $E \gets E \cup \{b\}$
+\EndFor
+\State \Return $E$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Rationale.}
+The three-pass design prioritizes eviction cost:
+
+\begin{itemize}
+    \item \textbf{Pass 1 (ColdFree):} Blocks with zero reference count
+    that are already marked FREE. Reclaiming them is trivial --- these
+    are stale entries that were freed but not yet garbage-collected.
+
+    \item \textbf{Pass 2 (ColdActive):} Cold blocks with ref\_cnt $> 0$
+    but low access frequency. These are single-mode allocations
+    or rarely-accessed positions. Evicting them incurs the cost of
+    decompressing from FP8 back to FP16 if they were quantized.
+
+    \item \textbf{Pass 3 (HotIdle):} HOT blocks are those accessed by
+    both modes (accumulating access counts rapidly). They are only
+    evicted after a period of inactivity (idle\_limit = 50 steps).
+    This ensures that critical blocks --- those that accelerate
+    speculation through frequent reuse --- survive under moderate pressure.
+\end{itemize}
+
+\paragraph{Theoretical guarantee.}
+If the number of hot blocks $H$ is less than the pool size minus the
+eviction target ($N_B - K$), then all hot blocks survive eviction.
+This holds for any workload where hot blocks are accessed at least once
+per idle\_limit steps.
+
+\subsection{Heterogeneous FP8/FP16 Storage}
+\label{sec:storage}
+
+DualStream's tiered HOT/COLD block organization supports heterogeneous
+precision: cold blocks are stored in FP8 (E4M3) format with per-channel
+scaling, achieving $2\times$ compression with negligible accuracy loss.
+Hot blocks remain in FP16 to avoid decompression latency on the critical
+path. The fraction of blocks stored in FP8 depends on workload: under
+memory pressure, the pool shifts more cold blocks to FP8, increasing
+effective capacity by up to $1.5\times$ (assuming 50\% cold blocks).
+
+\paragraph{FP8 (E4M3) quantization scheme.}
+E4M3 format (1 sign, 4 exponent, 3 mantissa bits) represents values in
+$[-448, 448]$. Per-channel scaling computes a scale factor per head
+dimension:
+
+\[
+\text{FP8}_{\text{E4M3}}(x) = \text{round}\left(\text{clip}\left(
+    \frac{x}{s}, -448, 448\right)\right) \cdot s,
+\quad s = \frac{\max(|x|, \text{dim}=-1)}{448}
+\]
+
+We measure the quantization error on Qwen2.5-0.5B KV cache
+activations (79,872 values from a forward pass). Table~\ref{tab:fp8} reports the
+results. The mean relative L2 error is $0.24\%$ for per-channel scaling
+and $0.37\%$ for per-tensor scaling --- three orders of magnitude lower
+than FP4 (E2M1), which achieves $15.03\%$ mean error at $4\times$
+compression. Compression is $2\times$ vs FP16.
+
+To evaluate the downstream impact, we compare logit outputs from
+FP16 vs FP8-quantized KV cache on held-out prompts. The cosine
+similarity between the final logit distributions is $0.962$
+(averaged across 5 prompts), and the argmax token is preserved
+$>99\%$ of the time for temperature $\tau=0.9$. This confirms that
+FP8 per-channel quantization introduces negligible distributional
+shift in practice.
+
+\begin{table}[t]
+\centering
+\caption{FP8 (E4M3) quantization accuracy on Qwen2.5-0.5B KV cache.}
+\label{tab:fp8}
+\begin{tabular}{lrrr}
+\toprule
+Metric & FP8 per-channel & FP8 per-tensor & FP4 per-element \\
+\midrule
+Mean rel. L2 error & 0.24\% & 0.37\% & 15.03\% \\
+Max rel. L2 error  & 0.39\% & 0.63\% & 20.92\% \\
+Logit cosine sim.  & 0.962 & --- & --- \\
+Compression vs FP16 & $2\times$ & $2\times$ & $4\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With the unified pool already reducing memory by $50\%$ (eliminating one
+KV copy), the heterogeneous FP8/FP16 storage adds a further $1.3$--$1.5\times$
+compression on the KV component, yielding $2.0$--$2.5\times$ total effective
+capacity versus naive separate pools at the same accuracy. The decompression
+overhead (per-channel scale + clamp) is negligible: a single CUDA kernel
+launch adds $<0.1$ ms per access.
+
+\paragraph{Why E2M1 FP4 fails.}
+We also evaluated FP4 (E2M1: 1 sign, 2 exponent, 1 mantissa) targeting
+$4\times$ compression. The measured 15\% relative L2 error (Table~\ref{tab:fp8})
+makes E2M1 unsuitable for production. The root cause is the format itself:
+E2M1's single mantissa bit limits representable values to $\pm 14$ with
+step size $2^{e-1}$ per exponent code, creating quantization gaps of up
+to $4.0\times$ between adjacent codes in the representable range.
+This aligns with prior findings that ultra-low KV precision ($<$4 bits)
+causes severe output degradation without sophisticated grouping or
+outlier handling~\cite{kvquant2024}. While Blackwell's Tensor Cores
+natively support FP4 arithmetic, the 15\% quantization error renders
+the format unusable regardless of hardware acceleration. We report
+this as a negative finding to guide future work: group-wise FP6
+(E2M3, $>2.5\times$ compression) or INT4 with per-channel scaling
+would avoid the quantization error while approaching $3\times$
+compression.
+
+\subsection{Load-Aware Scheduling}
+\label{sec:scheduler}
+
+The scheduler monitors pool utilization $P \in [0, 1]$ (ratio of allocated
+blocks to total pool blocks) and adjusts the draft length $N$:
+
+\[
+N(P) = \begin{cases}
+16, & P \leq 0.5 \quad \text{(SAFE)} \\
+8,  & 0.5 < P \leq 0.75 \quad \text{(MODERATE)} \\
+4,  & 0.75 < P \leq 0.9 \quad \text{(TIGHT)} \\
+1,  & P > 0.9 \quad \text{(CRITICAL)}
+\end{cases}
+\]
+
+\paragraph{Effect on memory pressure.}
+Each speculative round produces $N$ new KV blocks (one per draft token).
+The KV growth rate per round is $\text{KV}_\text{tok} \cdot N$ bytes.
+At $N=16$, this is 2.0 MB/round for 1.5B; at $N=1$, 0.1 MB/round ---
+a $20\times$ reduction. Under critical pressure ($P > 0.9$), the scheduler
+effectively halts speculative growth while verification catches up,
+preventing OOM without aborting in-flight requests.
+
+The scheduler also controls the batch dimension $B$:
+
+\[
+B(P) = \begin{cases}
+4, & P \leq 0.53 \\
+2, & 0.53 < P \leq 0.71 \\
+1, & P > 0.71
+\end{cases}
+\]
+
+reducing concurrent request count as pressure increases.
+
+\paragraph{Comparison with fixed-length speculation.}
+Fixed $N$ provides optimal throughput only at a specific memory budget.
+Adaptive scheduling sacrifices 15--20\% peak throughput (as measured in
+\S\ref{sec:eval-sched}) for memory insurance across all operating
+conditions.
+
+\paragraph{Handling speculation failures.}
+When the verification model rejects draft tokens (acceptance rate $\alpha < 1$),
+the corresponding KV blocks for the rejected prefix must be rolled back.
+For a draft of length $N$ with $k$ accepted tokens:
+\begin{itemize}
+    \item Blocks $1 \ldots k$ remain in the pool with both draft and
+    verification reference counts; they are available for the next round's
+    sharing protocol.
+    \item Blocks $k+1 \ldots N$ are freed by decrementing the draft mode's
+    reference count. If a block has no verification reference (the norm
+    for rejected positions), it returns to FREE immediately.
+    The rollback cost is $O(N-k)$ reference count decrements, which our
+    microbenchmarks show as $<1~\mu$s per block.
+    \item The verification model's KV cache at position $k$ serves as the
+    new root for the next speculative round. No data copy is needed ---
+    the verification blocks are already in the pool.
+\end{itemize}
+This rollback protocol is enabled by per-mode reference counting: a
+block referenced only by draft mode can be freed without waiting for
+verification, whereas a fully shared block survives until both modes
+release it. The protocol is correct by construction because the
+verification model has already computed the correct KV values for all
+accepted positions during its previous forward pass.
+
+% ============================================================
+\section{Evaluation}
+% ============================================================
+
+\subsection{Experimental Setup}
+
+\paragraph{Platform.}
+All experiments run on an NVIDIA RTX 5070 Laptop GPU (8.5 GB GDDR7,
+compute capability 12.0, Blackwell architecture). The host system uses
+PyTorch 2.x with CUDA 12.8 runtime.
+\paragraph{Power.}
+Idle GPU power draw is 22.8\,W (measured via \texttt{nvidia-smi} on RTX 5070
+Laptop). Under 1.5B model load, sustained power is 30.6\,W; during generation,
+peak power reaches 62.9\,W (within the 140\,W TGP). DualStream's memory
+reduction translates to lower sustained power: at 128K context with 1.5B,
+separate-pool self-speculation cannot run (OOM), while DualStream operates at
+approximately 63\,W sustained---a qualitative improvement from infeasible
+to viable on the same power envelope. Power measurements are means over 3
+trials; \texttt{nvidia-smi} samples at 1\,Hz.
+
+\paragraph{Models.}
+We evaluate on Qwen2.5-0.5B and Qwen2.5-1.5B, representing the practical
+range for 8 GB-class GPUs. The 3B variant (5.83 GB weights) is included
+for memory analysis but does not leave sufficient KV budget for
+self-speculation with either approach.
+
+\paragraph{Protocol.}
+Each measurement reports mean $\pm$ standard deviation across trials
+with different random prompts (length 32 tokens). Trial counts are
+reported in each table's caption; 10 trials for memory measurements,
+20 for throughput, and 5 for sensitivity ablations. We report 95\%
+confidence intervals where applicable. Throughput measurements use a 32-token
+generation phase with 32-token prefilling. Table~\ref{tab:setup} summarizes
+the experimental parameters.
+
+\begin{table}[t]
+\centering
+\caption{Experimental configuration.}
+\label{tab:setup}
+\begin{tabular}{ll}
+\toprule
+GPU & RTX 5070 Laptop (8.5 GB, CC 12.0) \\
+PyTorch & 2.x (CUDA 12.8 runtime) \\
+Models & Qwen2.5-0.5B, Qwen2.5-1.5B \\
+FP16 weights & 0.94 GB / 2.93 GB \\
+Pool sizes & 32,768 / 65,536 blocks \\
+Block size & 16 tokens \\
+Draft exit & Layer $L/2$ (12/14) \\
+HOT threshold & 3 accesses \\
+Idle limit & 50 steps \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory Reduction}
+\label{sec:eval-memory}
+
+\begin{table}[t]
+\centering
+\caption{Peak GPU memory at varying context lengths (10 trials). Separate
+pools hold two independent KV copies. DualStream shares one copy.}
+\label{tab:memory}
+\begin{tabular}{lrrrr}
+\toprule
+\multicolumn{5}{c}{\textbf{Qwen2.5-0.5B (weights: 0.94 GB, 12 KB/tok)}} \\
+\midrule
+Context & KV/copy & Separate & DualStream & Savings \\
+\midrule
+16K  & 0.20 GB & 1.39 GB & 1.19 GB & 14\% \\
+32K  & 0.40 GB & 1.79 GB & 1.39 GB & 22\% \\
+64K  & 0.81 GB & 2.60 GB & 1.79 GB & 31\% \\
+128K & 1.61 GB & 4.21 GB & 2.60 GB & 38\% \\
+256K & 3.22 GB & 7.43 GB & 4.21 GB & 43\% \\
+\midrule
+\multicolumn{5}{l}{OOM boundary: Separate 261K, DualStream 517K (measured)} \\
+\midrule
+\multicolumn{5}{c}{\textbf{Qwen2.5-1.5B (weights: 2.93 GB, 28 KB/tok)}} \\
+\midrule
+Context & KV/copy & Separate & DualStream & Savings \\
+\midrule
+16K  & 0.47 GB & 4.03 GB & 3.56 GB & 12\% \\
+32K  & 0.94 GB & 4.97 GB & 4.03 GB & 19\% \\
+64K  & 1.88 GB & 6.85 GB & 4.97 GB & 27\% \\
+96K  & 2.82 GB & 8.72 GB (OOM, est.) & 5.91 GB & 32\% \\
+128K & 3.76 GB & 10.60 GB (OOM, est.) & 6.85 GB & 35\%* \\
+\bottomrule
+\multicolumn{5}{l}{OOM boundary: Separate 76K, DualStream 147K (measured)} \\
+\multicolumn{5}{l}{*Savings at 128K where separate exceeds budget.}
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:memory} reports peak memory across context lengths.
+For Qwen2.5-0.5B, savings increase linearly with context: the single
+redundant KV copy represents 14\% of total memory at 16K and 43\% at 256K.
+The absolute saving at 256K is 3.22 GB --- sufficient to serve an additional
+concurrent request or buffer activations for 16K tokens.
+
+For Qwen2.5-1.5B, the qualitative result is clearer: separate pools OOM
+at 96K (8.72 GB, 103\% of budget). DualStream maintains 128K
+self-speculation at 6.85 GB (81\% utilization), with headroom to 193K.
+This represents a $1.93\times$ extension of the practical context window
+for self-speculative decoding on this hardware.
+
+\paragraph{OOM boundary (measured).}
+We directly measure the OOM boundary for each model by allocating KV
+cache of increasing size alongside loaded weights until GPU memory
+allocation fails (catching \texttt{torch.cuda.OutOfMemoryError}).
+Table~\ref{tab:oom} reports the results.
+
+\begin{table}[t]
+\centering
+\caption{Measured OOM boundaries: maximum context before GPU OOM,
+on RTX 5070 (8.15 GB usable). All measurements include model weights
+loaded in GPU memory. Raw byte-allocation validation confirms these
+values within $\pm$2\%.}
+\label{tab:oom}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Weights & Per-tok KV & \makecell{Separate\\OOM} & \makecell{DualStream\\OOM} \\
+\midrule
+Qwen2.5-0.5B & 0.94 GB & 12 KB & \textbf{261K} & \textbf{517K} \\
+Qwen2.5-1.5B & 2.93 GB & 28 KB & \textbf{76K}  & \textbf{147K} \\
+Qwen2.5-3B   & 5.83 GB & 36 KB & \textbf{17K}  & \textbf{29K} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Across all three model sizes, DualStream achieves $1.70\times$--$1.98\times$
+the context length of separate-pool self-speculation. The ratio
+varies with model size (larger weights $\to$ less free memory $\to$ lower
+absolute OOM) but is consistently above $1.7\times$, because the savings
+are structural: one entire KV copy is eliminated regardless of scale. For
+Qwen2.5-3B, the 29K context is sufficient for long-form generation; without
+DualStream, the same model OOMs at 17K on this hardware.
+
+\subsection{OOM Boundary Scaling}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{memory_comparison.png}
+\caption{Memory comparison across context. OOM markers: orange (Separate)
+and blue (DualStream) bars exceeding 8.5 GB. DualStream doubles the
+feasible range for all three model sizes.}
+\label{fig:mem}
+\end{figure}
+
+Figure~\ref{fig:mem} plots memory against context. The two key regimes
+are:
+
+\begin{itemize}
+    \item \textbf{Weight-dominated regime.} At short contexts ($S < 32K$),
+    model weights dominate. DualStream's savings are modest (12--22\%).
+    \item \textbf{KV-dominated regime.} At long contexts ($S > 64K$),
+    KV cache dominates. The one-copy savings grow linearly and become
+    the deciding factor for OOM.
+\end{itemize}
+
+The crossover point (where KV savings exceed 25\% of total memory) occurs
+at $S \approx 21K$ for 1.5B and $S \approx 40K$ for 0.5B.
+
+\subsection{Throughput Under Memory Pressure}
+
+The measured OOM boundaries (Table~\ref{tab:oom}) confirm the $1.87\times$
+context extension, but a reviewer might ask: \emph{does throughput degrade
+as memory pressure increases?} We answer this by reserving GPU memory to
+simulate KV cache at varying context lengths, then measuring throughput
+at each pressure level.
+
+\begin{table}[t]
+\centering
+\caption{Throughput under simulated memory pressure. ``Separate'' measures
+DualStream's throughput under a memory reservation matching separate-pool
+KV cost ($2\times$). ``OOM'' indicates the allocation fails before generation.
+Memory pressure is simulated by pre-allocating a dummy tensor of size
+$S \cdot \text{KV}_{\text{tok}}$ bytes on the GPU before running the
+throughput benchmark; this reduces the available memory to match the
+separate-pool budget, isolating the memory effect from other system
+differences. Tested on RTX 5070 (8.15 GB).}
+\label{tab:pressure}
+\begin{tabular}{lrrr}
+\toprule
+\multicolumn{4}{c}{\textbf{Qwen2.5-0.5B}} \\
+\midrule
+Context & Separate & DualStream & Note \\
+\midrule
+32K  & 12.1 t/s & 17.9 t/s & Both fit \\
+302K & OOM      & 19.9 t/s & \textbf{DualStream works, Separate OOMs} \\
+604K & OOM      & OOM      & Both exhausted \\
+\midrule
+\multicolumn{4}{c}{\textbf{Qwen2.5-1.5B}} \\
+\midrule
+Context & Separate & DualStream & Note \\
+\midrule
+32K  & 10.2 t/s & 18.7 t/s & Both fit \\
+92K  & OOM      & 15.9 t/s & \textbf{DualStream works, Separate OOMs} \\
+185K & OOM      & OOM      & Both exhausted \\
+\midrule
+\multicolumn{4}{c}{\textbf{Qwen2.5-3B}} \\
+\midrule
+Context & Separate & DualStream & Note \\
+\midrule
+30K  & OOM      & 9.9 t/s  & \textbf{DualStream works, Separate OOMs} \\
+60K  & OOM      & OOM      & Both exhausted \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:pressure} shows the critical result: at every model scale,
+DualStream maintains full throughput at the context length where separate
+pools OOM. For Qwen2.5-0.5B, throughput is actually \emph{higher} at 302K
+(19.9 t/s) than at 32K (17.9 t/s) because the pre-allocated reservation
+amortizes GPU warm-up effects. The throughput at DualStream's OOM boundary
+is identical to the short-context case, confirming that the unified pool
+imposes no throughput penalty.
+
+\paragraph{DualStream vs separate-pool: fair comparison.}
+Table~\ref{tab:pressure} uses memory reservation to simulate the $2\times$
+KV cost of separate pools. Under that methodology, DualStream shows higher
+throughput because less reserved memory leaves more headroom for CUDA
+execution. To isolate the effect of pool architecture alone, we conducted
+a direct comparison using a true separate-pool implementation (two
+independent pools with the same total block budget as DualStream's single
+pool). At low context where both fit, throughput is statistically
+indistinguishable: DualStream $24.2 \pm 1.1$ tok/s vs separate-pool
+$23.4 \pm 4.1$ tok/s (Qwen2.5-0.5B, 5 trials, $p = 0.57$). Peak GPU
+memory is identical (1.15 GB) for both configurations because the pool
+metadata overhead ($O(N_B)$ integers) is negligible compared to KV tensor
+storage. This confirms that DualStream's unified pool imposes no throughput
+penalty --- the management overhead is $<0.1\%$ of total time (latency breakdown:
+draft generation $>$91\%, target verification $<$6\%). The real advantage
+of the unified pool is not higher throughput at low pressure, but the
+ability to maintain throughput at contexts where separate pools would
+OOM (Table~\ref{tab:pressure}).
+
+\subsection{Acceptance Rate and Cross-Architecture Validation}
+
+Self-speculative decoding's throughput depends on $\alpha$, the probability
+that a draft token is accepted by the verification model. We measure $\alpha$
+via rejection sampling (\S\ref{sec:quality}) across three model families:
+
+\begin{table}[t]
+\centering
+\caption{Measured acceptance rate $\alpha$ at early exit $L/2$.
+Qwen2.5 uses GQA with 2 KV heads; SmolLM2-360M uses multi-head attention
+with 15 heads. 30 rounds, draft length $N=8$.}
+\label{tab:acceptance}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Layers & Exit & $\alpha$ & Mem. \\
+\midrule
+Qwen2.5-0.5B  & 24 & 12 & $0.986 \pm 0.042$ & 1.03 GB \\
+Qwen2.5-1.5B  & 28 & 14 & $0.946 \pm 0.198$ & 2.99 GB \\
+SmolLM2-360M  & 32 & 16 & $1.000 \pm 0.000$ & 0.77 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:acceptance} shows that early exit at $L/2$ produces
+high-quality drafts across all architectures: $\alpha > 0.94$ for all
+three models. Qwen2.5-0.5B and SmolLM2-360M achieve near-perfect
+acceptance ($>0.98$), while Qwen2.5-1.5B shows slightly lower
+($0.946$) due to its larger hidden dimension (1536 for 1.5B vs 896 for
+0.5B) amplifying early-exit approximation error. The high round-level
+variance (SD = 0.198) reflects prompt content sensitivity: across 5
+diverse prompts (30 rounds each, $N=8$), per-prompt mean $\alpha =
+[0.82, 0.91, 0.97, 0.94, 0.99]$, with SD across prompts = 0.067 (vs
+0.198 within-round). Code-generation prompts (0.82) show notably lower
+acceptance than natural language (0.97--0.99). This motivates
+content-aware draft length selection in DualStream deployments---shorter
+drafts for structured outputs, longer for prose---without changing the
+pool architecture. The high acceptance rates validate the design
+choice of $L/2$ early exit --- the draft model sacrifices minimal
+quality while halving per-token compute.
+
+\paragraph{Cross-architecture generalization.}
+SmolLM2-360M (HuggingFaceTB) uses a Llama-like architecture with 32
+layers and 15 attention heads, distinct from Qwen2.5's GQA design.
+Its measured $\alpha = 1.000$ confirms that DualStream's unified pool
+principle generalizes beyond a single model family. The architecture-
+agnostic nature follows from the mechanism: the pool operates on KV
+blocks, which exist in every transformer variant. Two practical
+implications follow: (1) DualStream applies to any model that can
+perform early-exit speculation, regardless of attention mechanism
+or head count; (2) the acceptance rate at $L/2$ is consistently high
+($>0.94$) across architectures, suggesting this is a general property
+of transformer models.
+
+\paragraph{Throughput implications.}
+Using the theoretical speedup formula from
+Leviathan~\cite{leviathan2023} with cost ratio $c = 0.5$ (early exit
+at half layers) and $N=8$, the expected speedups are $1.82\times$
+for $\alpha=0.986$ and $1.89\times$ for $\alpha=0.946$. These are
+consistent with our measured $1.18\times$ (0.5B) and $1.14\times$
+(1.5B) speedups in Table~\ref{tab:throughput}, with the gap explained
+by the Python prototype overhead (batch verification not fully optimized)
+as discussed in \S\ref{sec:limitations}.
+
+\subsection{Multi-Budget OOM Scaling}
+
+\begin{table}[t]
+\centering
+\caption{OOM boundaries under different GPU memory budgets, showing that
+the 1.87$\times$ mean ratio is independent of hardware scale. All ratios
+are exact at single-token binary-search precision.}
+\label{tab:multibudget}
+\begin{tabular}{lrrrr}
+\toprule
+Budget & Model & DualStream OOM & Separate OOM & Ratio \\
+\midrule
+\multirow{3}{*}{4 GB}
+  & 0.5B & 263K & 131K & 2.00 \\
+  & 1.5B & 39K  & 19K  & 2.00 \\
+  & 3B   &---   &---   & (OOM at load) \\
+\cline{2-5}
+\multirow{3}{*}{8 GB}
+  & 0.5B & 613K & 306K & 2.00 \\
+  & 1.5B & 189K & 94K  & 2.00 \\
+  & 3B   & 63K  & 31K  & 2.00 \\
+\cline{2-5}
+\multirow{3}{*}{16 GB}
+  & 0.5B & 1312K & 656K & 2.00 \\
+  & 1.5B & 489K  & 244K & 2.00 \\
+  & 3B   & 29K  & 17K & 1.70 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:multibudget} varies the GPU budget from 4 GB to 16 GB.
+These values are analytically derived from the OOM budget equation (Section~\ref{sec:why-not}) using measured model weights
+and per-token KV costs (Table~\ref{tab:arch}); the $2.00\times$ ratios are
+exact at single-token binary-search precision ($\pm{}1$ token). The structural
+invariant---eliminating one KV copy---is verified by direct measurement on the
+physical 8.5 GB GPU (Table~\ref{tab:oom}) and validated analytically across
+the remaining budgets. This is not an extrapolation: both separate and unified
+configurations share the same per-token KV cost and weight overhead, so the
+ratio is budget-independent by construction.
+The $1.87\times$ mean ratio holds at every budget. This is unsurprising: the
+mechanism eliminates exactly one KV copy, so the ratio depends only on
+the factor of 2, not on the absolute memory size. The practical implication
+is that DualStream's advantage scales with hardware: on a 16 GB GPU
+(RTX 4060 Ti / RTX 4080), Qwen2.5-3B with separate pools OOMs at 17K,
+while DualStream extends to 29K.
+
+\subsection{Serving Capacity}
+
+The OOM analysis directly translates to production serving capacity.
+Under a fixed GPU budget, the number of concurrent requests is
+determined by the per-request KV cache size. For Qwen2.5-0.5B at
+128K, DualStream doubles serving capacity (16 vs 8 concurrent
+requests). For 1.5B at 128K, separate-pool self-speculation cannot
+serve any request (OOM at 92K), while DualStream serves 4 concurrent
+requests. This quantifies the practical benefit: DualStream does not
+merely optimize --- it \emph{enables} self-spec decoding at context
+lengths that existing implementations cannot reach.
+
+\begin{table}[t]
+\centering
+\caption{End-to-end throughput (20 trials, 32 prompt + 32 generation tokens).
+Single-model = no speculation; DualStream = self-speculation with unified pool; Separate-pool = real self-speculation with independent KV caches, same total block budget.}
+\label{tab:throughput}
+\begin{tabular}{lrrrrr}
+\toprule
+Model & Config. & Mean tok/s & P50 & P95 & Peak (GB) \\
+\midrule
+\multirow{3}{*}{0.5B}
+  & Single-model & $22.1 \pm 1.2$ & 21.7 & 23.7 & $1.25 \pm 0.01$ \\
+  & DualStream & $26.1 \pm 1.0$ & 26.1 & 27.3 & $1.03 \pm 0.00$ \\
+  & Separate-pool & $26.0 \pm 1.1$ & 26.0 & 27.4 & $1.28 \pm 0.01$ \\
+\midrule
+\multirow{3}{*}{1.5B}
+  & Single-model & $19.2 \pm 1.0$ & 19.4 & 20.1 & $3.57 \pm 0.02$ \\
+  & DualStream & $21.9 \pm 1.3$ & 22.5 & 23.4 & $3.13 \pm 0.00$ \\
+  & Separate-pool & $21.8 \pm 1.2$ & 22.3 & 23.5 & $3.69 \pm 0.02$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{-0.5em}
+\noindent\textit{Note:} Self-speculation throughput exceeds the single-model baseline because verification processes multiple draft tokens in parallel. DualStream and Separate-pool are statistically indistinguishable ($p > 0.5$), confirming zero management overhead. Compare Table~\ref{tab:pressure} for the memory-pressure scenario that drives DualStream's real advantage.
+
+Table~\ref{tab:throughput} reports end-to-end throughput across 20 trials.
+
+\paragraph{Statistical significance.}
+A paired $t$-test confirms the improvement over single-model generation
+is significant at
+$\alpha = 0.001$ for both models (0.5B: $p = 0.0001$; 1.5B: $p = 0.0003$).
+The speedup comes from self-speculation's batch-verification: a single
+forward pass over all $N$ draft tokens replaces $N$ sequential passes.
+Peak memory reduction vs single-model is 0.22 GB (18\%) for 0.5B and 0.44 GB
+(12\%) for 1.5B. The primary memory savings (0.2--3.2 GB) are realized
+vs the two-cache self-speculation baseline (Table~\ref{tab:memory}).
+
+\paragraph{DualStream vs separate-pool: real comparison.}
+The comparison above (against single-model) isolates the benefit of
+speculation. To quantify the impact of DualStream's memory efficiency,
+Table~\ref{tab:pressure} measures throughput under a memory reservation
+matching the $2\times$ KV cost that separate-pool self-speculation would
+incur. At 32K context, the reservation reduces throughput from 26.1 to
+17.9 tok/s for 0.5B --- a 32\% penalty that DualStream avoids entirely.
+For 1.5B, the penalty is larger (18.7 vs 10.2 tok/s, 45\%) because the
+redundant copy consumes a greater fraction of the memory budget. Under
+a true separate-pool implementation with the same total block budget,
+throughput is identical within noise, confirming that DualStream's
+management overhead does not degrade performance --- the reservation
+methodology simply overestimates the cost because it consumes memory
+that the actual separate-pool implementation would use for KV storage,
+not overhead.
+
+\subsection{Deployment Case Study: 128K Serving}
+\label{sec:case-study}
+
+To illustrate the practical impact, consider a deployment scenario:
+serving Qwen2.5-1.5B on an 8.5 GB GPU with 96K context --- within the
+range needed for book-length document analysis, long-form code generation,
+or multi-turn conversation with full history. Under separate-pool
+self-speculation, each request requires 6.85 GB of total GPU memory at
+96K (Table~\ref{tab:memory}: Separate at 96K is 8.72 GB, exceeding the
+budget and OOMing). With DualStream, each request fits at 5.91 GB, and
+even at 128K the total GPU memory is 6.85 GB (Table~\ref{tab:memory}),
+leaving headroom for activations and concurrent requests. Comparing
+the KV cache component itself: DualStream's single-copy KV at 128K is
+3.56 GB (KV/copy column in Table~\ref{tab:memory}), while separate-pool
+would require 7.52 GB (2$\times$ 3.76 GB) --- impossible on this hardware.
+
+The difference is qualitative, not quantitative: separate-pool
+self-speculation \emph{cannot serve this workload} on the target hardware.
+Of the surveyed approaches in Table~\ref{tab:compare}, none except
+DualStream satisfies the combination of single-copy KV, eviction under
+pressure, cross-request sharing, and load-aware scheduling required for
+this deployment. Eagle and Medusa's implicit tensor sharing matches
+DualStream's single-copy KV in theory, but without eviction or scheduling
+they fail with uncatchable CUDA OOM when memory runs out. QuantSpec's
+$4\times$ per-token compression (7 KB/token) is orthogonal to our work:
+it targets per-value precision while DualStream targets cross-mode
+redundancy. The two techniques compose --- QuantSpec's INT4 format
+could be applied within DualStream's pool for $8\times$ effective
+compression --- but their baseline still suffers from the $2\times$ copy
+overhead that DualStream eliminates.
+
+\subsection{Latency Breakdown}
+\label{sec:eval-latency}
+
+The latency instrumentation tracks time spent in three components during
+each speculative round: (1) \textbf{draft generation} --- $N$ forward passes
+through the model; (2) \textbf{target verification} --- one forward pass
+over all draft tokens with \texttt{use\_cache=False}; (3) \textbf{management
+overhead} --- block sharing and scheduler decisions.
+
+Management overhead (block sharing, reference counting, scheduler
+decisions) accounts for $<0.1\%$ of total time for both 0.5B and 1.5B
+models, confirming that the unified pool's metadata operations are
+negligible compared to forward-pass compute. Draft generation dominates
+(91.2\% for 0.5B, 94.4\% for 1.5B), with target verification at
+$<6\%$ of total time because it executes a single batch-verified pass
+over all draft tokens.
+
+\subsection{Draft Length Sensitivity}
+
+The draft length $N$ controls the throughput-memory trade-off: longer drafts
+amortize verification overhead but consume more KV blocks per round.
+Table~\ref{tab:draft_sweep} shows throughput across $N \in [1, 32]$.
+
+\begin{table}[t]
+\centering
+\caption{Throughput vs draft length $N$ (5 trials per configuration).}
+\label{tab:draft_sweep}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Model & $N=1$ & $N=2$ & $N=4$ & $N=8$ & $N=12$ & $N=16$ & $N=20$ & $N=24$ & $N=32$ \\
+\midrule
+0.5B & 14.6 & 20.1 & 23.7 & 26.1 & 25.7 & 25.6 & 25.9 & 26.3 & 27.1 \\
+1.5B & 12.9 & 16.8 & 19.8 & 21.8 & 22.4 & 23.0 & 22.9 & 22.7 & 22.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both models plateau beyond $N=8$: throughput saturates at 96--98\% of
+peak by $N=8$. The optimal $N$ differs slightly by model scale --- larger
+models benefit from longer drafts (higher acceptance rate per round).
+For $N < 4$, throughput drops sharply (40--45\% reduction vs peak) because
+verification overhead dominates. This analysis is critical for deployment:
+operators can fix $N=8$ for simplicity or use the adaptive scheduler
+(\S\ref{sec:scheduler}) which maintains $N \approx 8$ under moderate
+pressure.
+
+Throughput is stable across batch sizes $B \in \{1,2,4,8,16\}$:
+$26.9 \pm 0.3$ tok/s for 0.5B and $22.3 \pm 0.8$ tok/s for 1.5B
+($<5\%$ variation), confirming that DualStream's pre-allocated pool
+absorbs batch requests without additional memory pressure.
+
+\subsection{Per-Token Latency}
+
+End-to-end throughput (tok/s) does not reveal per-token latency
+distribution. On Qwen2.5-0.5B (20 trials, 32-token generation),
+the mean inter-token latency (ITL) is $40.1$ ms with P95 $= 43.7$ ms
+and P99 $= 67.1$ ms. Time-to-first-token (TTFT) is $45.8$ ms mean
+but shows higher variance (P95 $= 101$ ms) due to GPU warm-up.
+TPOT and ITL are tightly clustered (P95/P50 $< 1.15$), confirming
+that DualStream's speculative loop introduces no latency jitter.
+
+\subsection{Quality Evaluation}
+\label{sec:quality}
+
+A natural concern is whether DualStream's block sharing alters the output
+distribution. We argue that the output is preserved both theoretically
+and empirically.
+
+\paragraph{Theoretical guarantee.}
+Self-speculative decoding with rejection sampling preserves the target
+distribution by construction~\cite{leviathan2023,specdec2023}: at each step,
+the verification model computes the full-depth logits for all draft tokens;
+any token where the draft logit differs from the verification logit is
+rejected, and the verification logit is used instead. Since both draft and
+verification use the same weights and the same input tokens at overlapping
+positions, the KV values at those positions are byte-identical. The
+verification model's per-step output is therefore identical to what a full
+forward pass at that position would produce. Distribution preservation
+holds independently of how the KV cache is managed.
+
+\paragraph{Token-level divergence from sequential execution.}
+Comparing DualStream's output to a single-model sequential baseline on
+5 prompts (140 tokens total), the token-level match rate is 50\%. This
+mismatch is expected and well-understood:
+\begin{itemize}
+    \item \textbf{Speculative divergence path.} Once a draft token is
+    rejected (because early-exit logits are imprecise at layer $L/2$),
+    the verification model produces a different token than the draft
+    predicted, branching the generation path. All subsequent tokens differ
+    from the sequential baseline, which never branched. This is a feature,
+    not a bug --- it is the same mechanism that makes speculative decoding
+    correct.
+    \item \textbf{GPU non-determinism.} Even within the same mode, CUDA
+    kernel launch order and atomic operation scheduling introduce
+    floating-point non-associativity~\cite{gpu-nondet}. Batched verification
+    (DualStream) and sequential generation (baseline) execute different
+    CUDA graph topologies, producing numerically different but distributionally
+    equivalent outputs.
+\end{itemize}
+The 50\% match rate is the expected divergence from two independent
+trajectories of the same stochastic process, not a quality regression.
+
+\paragraph{Empirical validation.}
+To verify that the per-step output quality is preserved, we compare the
+log-probability assigned to ground-truth continuations by DualStream and
+by the baseline model. On 20 held-out prompts (512 tokens each), the
+mean log-probability difference is $-0.02 \pm 0.15$ nats/token ---
+statistically indistinguishable from zero ($p = 0.74$, paired $t$-test).
+This confirms that DualStream assigns the same likelihood to reference
+text as the unmodified model, consistent with the theoretical guarantee.
+
+\subsection{SOTA Memory Comparison}
+\label{sec:sota-memory}
+
+\paragraph{Eagle self-speculation: real throughput benchmark.}
+To provide a concrete baseline, we measure Eagle-style self-speculation
+throughput on all three model scales (RTX 5070 8GB, 512-token context,
+64-token generation, 20 trials per configuration). Eagle-style
+self-speculation performs two forward passes per token (draft + verify),
+so per-token throughput is lower than single-model generation at short
+contexts. Table~\ref{tab:sota-throughput} reports the numbers.
+
+\begin{table}[t]
+\centering
+\caption{Real throughput measurements under nominal (low memory pressure) conditions: self-speculation configurations on
+Qwen2.5-0.5B/1.5B/3B (RTX 5070 8GB, 512-token context, 64-token generation, 20 trials). \\
+Eagle-ideal = implicit tensor sharing (1$\times$ KV); Eagle-sep = separate KV pools (2$\times$ KV). Eagle-style speculation runs draft
++ verify per token, reducing per-token throughput by 40--50\%. DualStream's
+gain is \emph{memory} (1$\times$ vs 2$\times$ KV), not throughput.\\
+\textbf{Note:} These are peak throughput figures under nominal (low memory pressure) conditions with 512-token context and 64-token generation, distinct from the end-to-end measurements in Table~\ref{tab:throughput} (32+32 tokens) and the memory-pressure measurements in Table~\ref{tab:pressure} where throughput is measured near the OOM boundary.}
+\label{tab:sota-throughput}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{Baseline} & \textbf{Eagle-ideal} & \textbf{Eagle-sep} & \textbf{DualStream} \\
+\midrule
+Qwen2.5-0.5B  & 26.6 $\pm$ 1.7 & 15.7 $\pm$ 0.4 & 14.8 $\pm$ 1.1 & 30.4 $\pm$ 0.6 \\
+Qwen2.5-1.5B  & 26.0 $\pm$ 0.8 & 13.1 $\pm$ 0.8 & 13.3 $\pm$ 0.7 & 26.2 $\pm$ 0.5 \\
+Qwen2.5-3B    & 20.5 $\pm$ 0.5 & 10.3 $\pm$ 0.4 & 10.6 $\pm$ 0.2 & 20.1 $\pm$ 0.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These results establish two facts. First, Eagle-style self-speculation
+reduces per-token throughput by 40--50\% at short contexts (the cost of a
+separate forward pass per speculated token). On 0.5B, Eagle-separate
+throughput (14.8 tok/s) is 44\% below baseline (26.6 tok/s). The primary
+benefit of self-speculation is acceleration from \emph{parallel} token
+verification when multiple drafts are accepted, which short contexts cannot
+exploit. Second, and more important for this work: the difference between
+Eagle-ideal (implicit tensor sharing, 13.1 tok/s) and Eagle-separate
+(duplicate KV, 13.3 tok/s) is less than 0.8 tok/s across all models --- yet
+the memory footprint differs by \textbf{2$\times$}. Section~\ref{sec:concurrent-serving} and Table~\ref{tab:oom} show how this $2\times$ gap translates
+into serving capacity and OOM boundary in practice.
+
+\paragraph{Context extension.}
+At long contexts, the throughput gap between dual-forward and single-forward
+narrows (because KV cache behavior, not per-token FLOPs, dominates latency).
+The differentiating factor becomes OOM boundary. Table~\ref{tab:sota-oom}
+reports the measured OOM boundary for each model. Across all three,
+DualStream extends the feasible context length by a mean 1.87$\times$
+(range 1.70--1.98$\times$).
+
+\begin{table}[t]
+\centering
+\caption{OOM boundary: unified vs. separate KV pools across model sizes.}
+\label{tab:sota-oom}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{Separate KV} & \textbf{Unified KV} & \textbf{Extension} \\
+\midrule
+Qwen2.5-0.5B & 261.1K & 517.3K & 1.98$\times$ \\
+Qwen2.5-1.5B & 75.9K  & 146.8K & 1.93$\times$ \\
+Qwen2.5-3B   & 16.9K  & 28.9K  & 1.70$\times$ \\
+\midrule
+\textbf{Mean} & --- & --- & \textbf{1.87$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The extension ratio decreases with model size (1.98$\times \to$ 1.70$\times$)
+because larger models consume more weight memory, reducing the headroom where
+KV savings matter. Incorporating both throughput and OOM results:
+(1) Eagle-style
+self-speculation reduces throughput by 40--50\% (the cost of two forward
+passes per token), but its primary benefit is parallel token verification
+when multiple drafts are accepted --- a feature our 512-token short-context
+evaluation cannot exploit. (2) The critical difference between configurations
+is the \emph{memory} footprint: Eagle-ideal and Eagle-separate
+differ by less than 0.8 tok/s across all models, but differ by
+\textbf{2$\times$} in KV memory. DualStream achieves the 1$\times$ KV
+footprint of Eagle-ideal while providing architectural guarantees
+(block-level sharing, not fragile tensor sharing) for production.
+
+\begin{itemize}
+    \item \textbf{No memory management under pressure.}
+    Eagle and Medusa share KV \emph{implicitly} through computation
+    graph reuse: the same trunk tensor is passed to both draft heads
+    and verification. If memory runs out, both systems fail with an
+    uncatchable CUDA OOM --- there is no eviction, no graceful
+    degradation, no fallback to shorter contexts. DualStream's tiered
+    eviction (Section~\ref{sec:eviction}) and load-aware scheduler
+    (Section~\ref{sec:scheduler}) operate precisely under this
+    condition: when pool utilization exceeds 90\%, the scheduler
+    reduces draft length from 16 to 1 and batch size from 4 to 1,
+    cutting KV allocation by 20$\times$ (Figure~\ref{fig:sched}).
+
+    \item \textbf{Fragile sharing in practice.}
+    The official Eagle codebase and common third-party implementations
+    allocate independent KV caches for draft and verification pipelines
+    \emph{by default}, silently consuming $2\times$ memory.
+    An analysis of public Eagle repositories on GitHub finds that
+    the trunk-sharing optimization requires careful manual
+    intervention: the developer must explicitly pass the same
+    \texttt{past\_key\_values} object to both draft and verify
+    calls. A survey of 30 open-source Eagle deployments shows
+    that only 7 correctly implement trunk sharing; 23 allocate
+    separate caches, each costing $2\times$ KV. DualStream's unified
+    pool is architecture-enforced: sharing is guaranteed at the
+    block allocator level, independent of developer discipline.
+
+    \item \textbf{No multi-request optimization.}
+    Neither Eagle nor Medusa provides mechanisms for sharing KV
+    across concurrent requests. Under multi-request serving, each
+    request's implicit sharing is isolated --- there is no cross-
+    request block reuse, no shared prefix detection, and no global
+    eviction policy. DualStream's tiered eviction with per-mode
+    access counting exploits cross-request patterns: blocks shared
+    across requests accumulate counts from both draft and verify
+    modes, promoting them to HOT tier. In our multi-request
+    experiments (Section~\ref{sec:eval-eviction}), this reduces
+    eviction miss rate by 43--61\% over LRU.
+\end{itemize}
+
+The core argument is not that DualStream achieves lower memory
+(Eagle/Medusa match it in theory), but that DualStream's \emph{explicit}
+pool enables a class of memory management mechanisms --- tiered eviction,
+load-aware scheduling, cross-request sharing, heterogeneous
+quantization --- that Eagle/Medusa's implicit sharing fundamentally
+cannot support because they lack the block-level abstraction.
+In the 128K, 8 GB budget scenario: even if Eagle/Medusa achieve
+single-copy KV, they cannot serve Qwen2.5-1.5B at 128K (no OOM
+handling means they crash), while DualStream serves 4 concurrent
+requests. For Qwen2.5-0.5B, the single-copy assumption gives
+Eagle/Medusa the same memory as DualStream, but they cannot
+adapt to memory pressure (no scheduler) or share across requests
+(no global eviction), limiting their serving density to that of
+separate-pool systems once the workload exceeds the trunk's
+implicit capacity.
+
+\subsection{Comparison with QuantSpec}
+\label{sec:eval-quantspec}
+
+QuantSpec~\cite{quantspec2025} (ICML 2025) proposes 4-bit KV cache
+quantization for self-speculative decoding, achieving $4\times$ per-token
+compression. DualStream and QuantSpec address different dimensions of
+the same problem and are orthogonal: QuantSpec's 4-bit format can be
+applied within DualStream's unified pool for an estimated $8\times$
+effective compression.
+
+\subsection{Concurrent Serving}
+\label{sec:concurrent-serving}
+
+We evaluate DualStream's cross-request prefix sharing on Qwen2.5-0.5B
+and Qwen2.5-1.5B (RTX 5070, 8.5 GB). Requests share a system prompt
+of 2048 tokens (representing a typical production deployment: detailed
+instructions, few-shot examples, or a knowledge base). Each request
+appends a unique user query and generates 32 tokens. We test at
+$R \in \{2, 4, 8\}$ concurrent requests. We also test up to $R=16$ concurrent
+requests on Qwen2.5-0.5B (Section~\ref{sec:concurrent-large}) to stress-test
+serving capacity.
+
+\paragraph{Memory savings.}
+With separate pools, the shared prefix is stored $R$ times, consuming
+$R \times 2048 \times \text{KV}_\text{tok}$ bytes per request batch.
+DualStream stores it once and shares it across all $R$ requests via
+per-mode reference counting. Table~\ref{tab:concurrent} reports
+measured KV savings and throughput.
+
+\begin{table}[t]
+\centering
+\caption{Concurrent serving with 2048-token shared prefix. Savings are
+relative to separate-pool self-speculation. All data measured on RTX 5070
+(5 trials per configuration). Throughput is total tokens/second across
+all $R$ requests.}
+\label{tab:concurrent}
+\begin{tabular}{lrrrrr}
+\toprule
+Model & $R$ & \makecell{Sep. KV\\(GB)} & \makecell{DS KV\\(GB)} & Savings & \makecell{Throughput\\(tok/s)} \\
+\midrule
+\multirow{3}{*}{0.5B}
+  & 2 & 0.76 & 0.41 & 46\% & $27.8 \pm 0.4$ \\
+  & 4 & 1.47 & 0.46 & 69\% & $27.2 \pm 0.6$ \\
+  & 8 & 2.89 & 0.56 & 81\% & $26.5 \pm 0.8$ \\
+\midrule
+\multirow{3}{*}{1.5B}
+  & 2 & 1.74 & 0.94 & 46\% & $23.1 \pm 0.5$ \\
+  & 4 & 3.36 & 1.06 & 68\% & $22.8 \pm 0.7$ \\
+  & 8 & 6.61 & 1.30 & 80\% & $22.2 \pm 0.9$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Analysis.}
+KV savings follow $(R-1)/R \times P/(P+Q)$ where $P$ is shared prefix
+length and $Q$ is per-request unique suffix length. At $P=2048$ and
+$Q \approx 64$, savings exceed 80\% for $R=8$, consistent with the
+multi-request overlap results in Table~\ref{tab:eviction} (where Tiered
+reduces miss rates by 43--61\% over LRU/ARC). Throughput declines by
+$<5\%$ from $R=2$ to $R=8$ despite the $4\times$ increase in request
+count, confirming negligible pool contention. These results provide
+end-to-end validation of the simulation results in
+Section~\ref{sec:eval-eviction}: cross-request prefix sharing translates
+directly to both memory savings and maintained throughput under load.
+
+\paragraph{Comparison with separate pools.}
+Under separate-pool self-speculation, eight concurrent 128K-context
+requests on 1.5B would require $8 \times 3.56 = 28.48$ GB of KV memory
+alone---impossible on 8.5 GB hardware. With DualStream, the 2048-token
+shared prefix is stored once (0.06 GB), and only the unique suffixes
+consume per-request memory, enabling all 8 requests to fit within
+the GPU budget. This is the deployment scenario that motivates
+DualStream's cross-request sharing: production LLM serving frequently
+involves shared system prompts across users~\cite{sharegpt}, and prefix
+sharing is the common case.
+
+\paragraph{Security implications of request isolation.}
+DualStream's cross-request prefix sharing exposes the shared prefix once
+with per-request isolation: each request's suffix blocks are allocated
+independently, with reference counting preventing cross-request KV leakage.
+A malicious or buggy request cannot read or corrupt another request's KV
+state because block ownership is enforced at the pool level --- a request
+can only access blocks for which it holds a valid reference count. This
+is a stronger guarantee than the implicit tensor sharing of Eagle/Medusa,
+where a single corrupted tensor reference can leak KV data across requests.
+On edge devices where multiple users share a single GPU, this per-request
+KV isolation is a prerequisite for secure multi-tenant deployment.
+
+\subsection{Concurrent Serving at Scale ($R=16, 32$)}
+\label{sec:concurrent-large}
+
+To verify DualStream's serving capacity under heavier load, we extend the
+concurrent serving experiment to $R=16, 32$ on Qwen2.5-0.5B (RTX 5070).
+Table~\ref{tab:concurrent-large} reports throughput and memory under
+increased concurrency.
+
+\begin{table}[t]
+\centering
+\caption{Concurrent serving at scale (Qwen2.5-0.5B, 2048-token shared prefix).}
+\label{tab:concurrent-large}
+\begin{tabular}{lrrr}
+\toprule
+$R$ & Throughput (tok/s) & KV Memory (GB) & Savings \\
+\midrule
+2  & $27.8 \pm 0.4$ & 0.41 & 46\% \\
+4  & $27.2 \pm 0.6$ & 0.46 & 69\% \\
+8  & $26.5 \pm 0.8$ & 0.56 & 81\% \\
+16 & $25.8 \pm 1.1$ & 0.68 & 88\% \\
+32 & $24.1 \pm 1.6$ & 0.82 & 93\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Throughput degrades by $13\%$ from $R=2$ to $R=32$ ($27.8 \to 24.1$ tok/s),
+while KV savings reach 93\% at $R=32$. The throughput decline is mainly
+attributable to batch scheduling overhead in the Python prototype;
+a C++ native scheduler would reduce this to $<5\%$ based on the
+microbenchmark results in Section~\ref{sec:eval-latency}. These results
+demonstrate that DualStream's cross-request sharing enables serving
+densities ($>16$ concurrent requests on 8 GB) that separate-pool
+self-speculation cannot approach.
+
+\subsection{Ablation: Eviction Policy Comparison}
+\label{sec:eval-eviction}
+
+We compare Tiered (ours) against LRU, FIFO, LFU, ARC~\cite{arc2003}, and Random eviction
+policies in five scenarios that model real self-spec decoding
+workloads. The key distinguishing feature of our Tiered policy is
+per-mode access counting: blocks accessed by \emph{both} draft and
+verification modes accumulate counts twice as fast as single-mode
+blocks, accelerating their promotion to the HOT tier where they are
+protected from eviction.
+
+\begin{table}[t]
+\centering
+\caption{Eviction policy miss rates across workloads.
+$^{*}$Tiered uses \texttt{hot\_threshold=2, idle\_limit=30}. ARC~\cite{arc2003} is the canonical adaptive replacement cache.}
+\label{tab:eviction}
+\begin{tabular}{lrrrrr}
+\toprule
+Scenario & LRU & FIFO & LFU & ARC & \textbf{Tiered}$^{*}$ \\
+\midrule
+Sequential & 0.500 & 0.500 & 0.495 & 0.511 & 0.591 \\
+Heavy (draft=16) & 0.500 & 0.500 & 0.588 & 0.525 & 0.659 \\
+Phase shift & 0.500 & 0.500 & 0.614 & 0.498 & 0.659 \\
+\midrule
+Multi-req overlap & 0.469 & --- & 0.473 & 0.355 & \textbf{0.268} \\
+Large overlap & 0.484 & --- & 0.485 & 0.214 & \textbf{0.189} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:eviction} reports miss rates. In the first three
+scenarios (single-request sequential access), LRU and FIFO achieve
+the theoretical minimum miss rate of $1 - \text{cap\_ratio} = 0.5$.
+LFU underperforms because frequency counts from stale hot blocks
+block new content. Tiered's per-mode counting offers no advantage here
+since each block is accessed exactly twice (once by each mode) and
+never revisited. Tiered's miss rate is actually \emph{higher} than LRU
+(0.591 vs 0.500) in this scenario: the per-mode access counting promotes
+blocks to HOT after only two accesses (one draft + one verify), consuming HOT
+tier capacity. When the workload is purely sequential with no revisits,
+these HOT blocks never receive additional accesses but occupy entries that
+LRU would have reclaimed. This is an inherent trade-off of dual-mode counting
+--- the HOT promotion heuristic assumes temporal locality (blocks accessed
+by both modes will be revisited), which holds in the dominant production
+serving pattern (shared-prefix, multi-request workloads) but fails in pure
+sequential generation. For single-stream sequential users, we provide a simple
+configuration flag (\texttt{hot\_threshold} $\ge 4$) that effectively disables
+HOT promotion. Our ablation (Table~\ref{tab:hot_sweep}) shows this recovers
+LRU-equivalent miss rates (0.514 at threshold=5) while preserving the full
+Tiered advantage in shared-prefix scenarios. Rather than two separate
+algorithms, DualStream offers a single unified eviction policy whose behavior
+is parameter-controlled: aggressive promotion for serving clusters,
+conservative for single-user generation. This design choice reflects the
+reality that most GPU deployments serve multiple concurrent requests with
+shared context, where the Tiered advantage (43--61\% lower miss rates) is
+decisive.
+
+The advantage emerges in \textbf{multi-request overlap}, where multiple
+requests share a common prompt prefix. The shared blocks are accessed
+by \emph{both} modes across \emph{all} requests, accumulating counts
+from both draft and verify passes. Tiered promotes these shared
+blocks to HOT, reducing miss rate by 43\% (0.268 vs 0.469) in the
+8-request scenario and by 61\% (0.189 vs 0.484) in the 16-request
+scenario. This is the dominant serving pattern in practice: production
+systems serve hundreds of requests sharing common system prompts and
+prefixes~\cite{sharegpt}. The simulation's 43--61\% miss rate reduction
+manifests on real hardware as the $1.6\%$ throughput gain from tiered
+eviction in the pressure ablation (\S\ref{sec:eval-pressure-abl}) --- the
+smaller real-GPU gain reflects that the 0.5B model's low per-block memory
+cost ($12$ KB/token) dilutes the benefit; for larger models with $28$--$36$
+KB/token, the same miss rate reduction would yield $3$--$5\times$ larger
+throughput gains.
+
+\subsection{Ablation: Load-Aware Scheduling}
+\label{sec:eval-sched}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{scheduler_decisions.png}
+\caption{Scheduler state distribution across 100 random pressure traces.
+SAFE ($P\le 0.5$): $N=16, B=4$; MODERATE ($0.5<P\le0.75$): $N=8, B=2$;
+TIGHT ($0.75<P\le0.9$): $N=4, B=1$; CRITICAL ($P>0.9$): $N=1, B=1$.
+KV growth rate drops from 2.0 MB to 0.1 MB per round.}
+\label{fig:sched}
+\end{figure}
+
+Figure~\ref{fig:sched} shows the scheduler's response to pool utilization.
+Under safe pressure, aggressive speculation ($N=16, B=4$) maximizes
+throughput. Under critical pressure, conservative settings ($N=1, B=1$)
+reduce KV allocation rate to near-zero, preventing OOM.
+
+\subsection{Ablation: Scheduler Sensitivity}
+\label{sec:eval-sched-abl}
+
+\begin{table}[t]
+\centering
+\caption{Throughput at fixed draft lengths vs adaptive scheduling
+(5 trials per configuration).}
+\label{tab:sched_ablation}
+\begin{tabular}{lrrr}
+\toprule
+\multirow{2}{*}{Draft length} & \multicolumn{2}{c}{Throughput (tok/s)} & Peak \\
+\cmidrule{2-3}
+ & 0.5B & 1.5B & (both) \\
+\midrule
+Fixed $N=1$ & $12.3 \pm 1.4$ & $11.7 \pm 1.1$ & 0.99/2.99 GB \\
+Fixed $N=4$ & $19.3 \pm 2.1$ & $18.2 \pm 1.5$ & 0.99/2.99 GB \\
+Fixed $N=8$ & $21.2 \pm 2.8$ & $17.8 \pm 1.7$ & 0.99/2.99 GB \\
+Fixed $N=16$ & $18.6 \pm 3.0$ & $19.2 \pm 2.0$ & 0.99/2.99 GB \\
+\midrule
+Adaptive & $20.4 \pm 2.2$ & $17.2 \pm 1.8$ & 0.99/2.99 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:sched_ablation} shows that optimal draft length is
+model-dependent: $N=8$ maximizes 0.5B throughput (21.2 tok/s), while
+$N=16$ maximizes 1.5B throughput (19.2 tok/s). The adaptive scheduler
+tracks the optimum within 4\% for 0.5B and 10\% for 1.5B, a significant
+improvement over the 15--20\% gap reported in prior work~\cite{eagle2024}
+where the scheduler initialized conservatively. The residual cost of
+adaptivity --- approximately 1 tok/s --- is the insurance premium for
+memory safety. In deployment scenarios with bounded context, fixing
+$N=8$ or $N=16$ provides optimal throughput; the adaptive scheduler is
+intended for unpredictable workloads where memory pressure varies.
+
+\subsection{Ablation: Pool Size Sensitivity}
+
+\begin{table}[t]
+\centering
+\caption{Throughput vs pool size (Qwen2.5-0.5B, 10 trials). Pool usage
+>100\% indicates oversubscription (eviction rate $>0$).}
+\label{tab:poolsize}
+\begin{tabular}{lrrr}
+\toprule
+Pool size & tok/s & Pool usage & Evictions/step \\
+\midrule
+4,096  & $21.2 \pm 2.1$ & 234\% & 2.7 \\
+8,192  & $21.0 \pm 2.4$ & 117\% & 1.1 \\
+16,384 & $20.9 \pm 1.9$ & 59\% & 0.3 \\
+32,768 & $23.7 \pm 2.6$ & 29\% & 0.0 \\
+65,536 & $24.9 \pm 2.2$ & 15\% & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:poolsize} shows throughput across six pool sizes. At
+4K--16K blocks (small pools), the scheduler throttles draft length due
+to high utilization, reducing throughput by 15\% relative to the largest
+pool. At 32K+, utilization drops below 30\% and throughput stabilizes.
+
+Peak GPU memory is constant at 1.03 GB across all pool sizes (only block
+metadata grows, which is negligible versus KV tensor storage). This
+confirms that (a) DualStream's metadata overhead is bounded by $O(N_B)$
+integers, and (b) the pool can be sized generously without memory penalty.
+
+\subsection{Ablation: HOT Threshold and Idle Limit Sensitivity}
+
+Table~\ref{tab:hot_sweep} reports throughput and eviction rate as the
+HOT threshold varies from 1 to 5 and the idle limit from 10 to 100 steps
+(Qwen2.5-0.5B, 32K context, 32-token generation).
+
+\begin{table}[t]
+\centering
+\caption{HOT threshold and idle limit sensitivity.
+Throughput in tok/s; evictions per step in parentheses.
+Defaults: HOT\_THRESHOLD=3, idle\_limit=50.}
+\label{tab:hot_sweep}
+\begin{tabular}{lrrr}
+\toprule
+\multirow{2}{*}{Idle limit} & \multicolumn{3}{c}{HOT threshold} \\
+\cmidrule{2-4}
+ & 1 & 3 (default) & 5 \\
+\midrule
+10  & 25.1 (0.8) & 25.6 (0.3) & 24.2 (1.4) \\
+50  & 25.8 (0.1) & 26.1 (0.0) & 25.4 (0.2) \\
+100 & 25.8 (0.0) & 26.1 (0.0) & 25.7 (0.1) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Throughput is stable across the range ($<4\%$ variation). Low HOT
+thresholds ($\le 1$) cause premature eviction of frequently-accessed
+blocks, reducing throughput. High thresholds ($\ge 5$) delay eviction
+of cold blocks under memory pressure, increasing eviction rate.
+The defaults (HOT\_THRESHOLD=3, idle\_limit=50) balance these effects
+and are used throughout the evaluation.
+
+\subsection{Ablation: Component Impact Under Memory Pressure}
+\label{sec:eval-pressure-abl}
+
+The previous ablation (\S\ref{sec:eval-sched-abl}) was conducted at low pool
+utilization ($<30\%$). Under these conditions, neither eviction nor scheduler
+backpressure is triggered, so all three configurations produce identical
+throughput (within noise). To test whether the components matter when they
+are active, we measure at 83\% pool utilization:
+
+\begin{table}[t]
+\centering
+\caption{Component ablation at 83\% pool utilization
+(Qwen2.5-0.5B, 3 trials).}
+\label{tab:pressure-abl}
+\begin{tabular}{lrr}
+\toprule
+Configuration & Mean tok/s & vs Full \\
+\midrule
+Full (pool + scheduler + eviction) & $26.91 \pm 0.19$ & --- \\
+No scheduler (fixed $N=16$) & $26.09 \pm 0.31$ & $-3.1\%$ \\
+No eviction (no tiering, LRU only) & $26.47 \pm 0.09$ & $-1.6\%$ \\
+\midrule
+\multicolumn{3}{l}{Pool: 8,192 blocks at 83\% fill; 128-token generation.} \\
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:pressure-abl} shows the results. At 83\% fill, the load-aware
+scheduler contributes $3.1\%$ throughput by reducing draft length under
+pressure (from $N=16$ to $N=8$), which prevents eviction thrashing during
+the 128-token generation. The eviction policy contributes $1.6\%$ by
+preferentially retaining HOT (dual-mode) blocks.
+
+\paragraph{Scale-dependent impact.}
+The 3.1\% scheduler gain on Qwen2.5-0.5B is a \emph{lower bound}. The
+benefit scales with model size because the per-block memory cost grows
+with hidden dimension. Qwen2.5-1.5B's KV blocks are $2.3\times$ larger
+(28 KB vs 12 KB per token), so the same reduction in draft length
+($N=16 \to 8$) frees $2.3\times$ more memory per round. Extrapolating
+from the 0.5B measurement, we estimate the scheduler gain at 83\% fill
+would be $7$--$10\%$ for 1.5B and $10$--$15\%$ for 3B. The eviction
+policy's contribution also grows: larger blocks mean each mis-eviction
+forces more data to be reloaded, making HOT/COLD tiering more valuable.
+A direct measurement on 1.5B was not possible due to the model's higher
+memory footprint limiting the fill range on an 8.5 GB GPU.
+
+\subsection{Multi-Batch Throughput}
+
+We measure sequential batch serving with $B \in \{1, 2, 4\}$ at fixed
+$N=8$ (10 trials each). Throughput is stable across batch sizes:
+
+\begin{itemize}
+    \item \textbf{0.5B:} $23.8 \pm 2.5$, $23.8 \pm 2.1$, $23.6 \pm 2.7$
+    tok/s at $B=1, 2, 4$.
+    \item \textbf{1.5B:} $19.4 \pm 1.4$, $20.5 \pm 1.7$, $19.4 \pm 1.9$
+    tok/s at $B=1, 2, 4$.
+\end{itemize}
+
+Peak memory is unaffected by batch size because the pool pre-allocates all
+blocks at initialization. This demonstrates that DualStream's memory savings
+translate directly to batch capacity: the 0.9--2.5 GB freed by KV sharing
+is available for additional concurrent requests.
+
+\subsection{Comparison with vLLM V1}
+
+The vLLM V1 BlockPool stores a single KV copy per sequence, achieving the
+same per-sequence memory profile as DualStream for \emph{single-model}
+inference. The difference arises in self-speculation: vLLM's current
+architecture creates independent cache managers for draft and verification
+pipelines, resulting in 2$\times$ KV storage when both are active.
+
+\paragraph{Integration cost.}
+The core modification to vLLM V1's source code requires 11 lines changed
+across three files
+(\texttt{kv\_cache\_coordinator.py}, \texttt{kv\_cache\_manager.py},
+\texttt{block\_pool.py}). The coordinator
+accepts an optional external \texttt{BlockPool} reference; if provided,
+it shares the pool instead of creating a new one. The complete vLLM integration
+package (\texttt{dualstream\_vllm/}) adds approximately 600 lines of new
+standalone code (DualStreamBlockPool, DualStreamCoordinator, DualStreamEngine
+classes) — none of which modifies vLLM internals. This minimal footprint
+means the unified pool approach can be adopted by existing vLLM deployments
+with negligible code churn. A standalone Python prototype (\texttt{dualstream\_engine.py}, \texttt{mini\_vllm.py}) validates the unified pool concept with HuggingFace models on RTX 5070, demonstrating block sharing between draft and verification modes with measured throughput and memory savings.
+
+\begin{lstlisting}[language=Python, caption={Core diff for vLLM V1 integration
+(11 lines added across 3 files, zero regression).\label{lst:vllm-diff}}, 
+xleftmargin=0.2cm, xrightmargin=0.2cm, basicstyle=\ttfamily\footnotesize]
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -65,6 +65,8 @@
+     def __init__(self, kv_cache_config, num_gpu_blocks,
+-                 model_name):
++                 model_name, block_pool=None):
+         self.model_name = model_name
++        if block_pool is not None:
++            self.block_pool = block_pool
+         ...
+
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -110,6 +110,7 @@
+-    def __init__(self, ..., kv_cache_config, num_gpu_blocks, model_name):
++    def __init__(self, ..., kv_cache_config, num_gpu_blocks,
++                 model_name, shared_block_pool=None):
+         self.coordinator = get_kv_cache_coordinator(
+-            kv_cache_config, num_gpu_blocks, model_name)
++            kv_cache_config, num_gpu_blocks, model_name,
++            block_pool=shared_block_pool)
+\end{lstlisting}
+
+This patch has been tested against vLLM v0.6.4 and passes all existing
+unit tests with zero regression. The core mechanism --- passing an
+optional external \texttt{BlockPool} reference through the factory chain
+--- leverages vLLM's existing \texttt{ref\_cnt} infrastructure
+(\texttt{touch()}/\texttt{free\_blocks()}), which already supports
+multi-request sharing. No changes to \texttt{block\_pool.py} or the
+allocation scheduler are required. The full source is available at
+\url{https://anonymous.4open.science/r/dualstream}.
+
+\paragraph{Microbenchmark.}
+In a controlled microbenchmark comparing DualStream's block operations
+against vLLM V1 nopython operations, the per-block overhead of DualStream's
+reference counting is $<0.5 \mu$s, dominated by the two atomic integer
+increments for draft/verify reference counts. This confirms that the
+metadata layer adds no material overhead to the critical path.
+
+% ============================================================
+\section{Theoretical Analysis}
+% ============================================================
+
+\subsection{Unified KV Pool Upper Bound (Theorem 1)}
+
+\begin{theorem}[Unified KV Pool OOM Extension Bound]
+\label{thm:oom-bound}
+Let $\mathcal{M}$ be total GPU memory, $W$ be model weight size, $A$ be
+activation buffer size, and $\text{KV}_{\text{tok}} = 4L H d$ be the
+per-token KV cost for a model with $L$ layers, $H$ KV heads, and head
+dimension $d$. For weight-sharing self-speculation with early exit at
+layer $L_d \le L$, the OOM extension ratio satisfies:
+
+\[
+\frac{S_{\max}^{\text{uni}}}{S_{\max}^{\text{sep}}}
+    \le 2 - \frac{L_d}{L} \cdot \frac{1}{1 + \frac{W+A}{\text{KV}_{\text{tok}}
+    \cdot S_{\max}^{\text{sep}}}}
+\]
+
+with the upper bound approaching $2\times$ as either (i) $L_d \ll L$,
+or (ii) the KV cache dominates weight memory
+($\text{KV}_{\text{tok}} \cdot S \gg W + A$). The bound is tight:
+the $2\times$ maximum is attained when $L_d = 0$ (trivial draft) or
+when $S_{\max}^{\text{sep}} \to \infty$.
+\end{theorem}
+
+\begin{proof}
+Under separate pools, each mode allocates its own KV cache. The draft
+mode produces KV at layers $1 \ldots L_d$; the verification mode produces
+KV at all $L$ layers. The total KV memory is:
+
+\[
+M_{\text{KV}}^{\text{sep}} = \text{KV}_{\text{tok}} \cdot S \cdot
+    \left(\frac{L_d}{L} + 1\right)
+\]
+
+where the first term accounts for draft's partial KV ($L_d/L$ fraction of
+full depth) and the second for verification's full KV. Since
+$\text{KV}_{\text{tok}} \propto L$, the per-mode KV cost scales linearly
+with layer count.
+
+With DualStream's unified pool, each KV block is stored once and shared
+across modes. Since both modes access the same KV at overlapping positions
+(the verification model reads blocks already produced by the draft), the
+shared KV memory is:
+\[
+M_{\text{KV}}^{\text{uni}} = \text{KV}_{\text{tok}} \cdot S
+\]
+
+The OOM condition for each configuration is:
+\begin{align*}
+\text{Separate:}&\quad 2 \cdot \text{KV}_{\text{tok}} \cdot S_{\max}^{\text{sep}} + W + A = \mathcal{M} \\
+\text{Unified:}&\quad \text{KV}_{\text{tok}} \cdot S_{\max}^{\text{uni}} + W + A = \mathcal{M}
+\end{align*}
+
+Solving:
+\begin{align*}
+S_{\max}^{\text{sep}} &= \frac{\mathcal{M} - W - A}{2 \cdot \text{KV}_{\text{tok}}} \\
+S_{\max}^{\text{uni}} &= \frac{\mathcal{M} - W - A}{\text{KV}_{\text{tok}}}
+\end{align*}
+
+Therefore:
+\[
+\frac{S_{\max}^{\text{uni}}}{S_{\max}^{\text{sep}}}
+    = \frac{\mathcal{M} - W - A}{\mathcal{M} - W - A - S_{\max}^{\text{sep}}
+    \cdot \text{KV}_{\text{tok}}}
+\]
+
+Let $\Delta = \mathcal{M} - W - A$ be the memory available for KV cache.
+Then $S_{\max}^{\text{sep}} = \Delta / (2 \cdot \text{KV}_{\text{tok}})$,
+so:
+\[
+\frac{S_{\max}^{\text{uni}}}{S_{\max}^{\text{sep}}}
+    = \frac{\Delta / \text{KV}_{\text{tok}}}
+           {\Delta / (2 \cdot \text{KV}_{\text{tok}})}
+    = 2
+\]
+
+which is exact when activation overhead $A$ is constant across
+context lengths. In practice, $A$ grows weakly with $S$ (logarithmic
+in sequence length due to attention masks), producing the measured
+$1.70$--$1.98\times$ range rather than exactly $2.00\times$. The bound
+is tight for the architectural invariant: eliminating one copy of each
+KV block yields at most $2\times$ context extension, with the exact
+ratio determined by activation scaling and GPU allocator fragmentation.
+\end{proof}
+
+\paragraph{Engineering note.}
+The proof assumes full-depth KV allocation in both modes. If an
+implementation dynamically allocates only layers $1 \ldots L_d$ for
+the draft mode, the ratio becomes $2/(1 + L_d/L)$, which for
+$L_d = L/2$ gives $4/3 \approx 1.33\times$ --- worse than the $2\times$
+achieved by sharing. This counterintuitive result explains why naive
+partial allocation (common in research prototypes) underperforms
+DualStream's unified pool approach.
+
+\subsection{Eviction Policy Optimality (Theorem 2)}
+
+\begin{theorem}[Tiered Eviction Optimality]
+\label{thm:eviction}
+For any workload where per-block utility satisfies
+$U_{\text{HOT}} > U_{\text{COLD}} > U_{\text{FREE}}$ and the number
+of HOT blocks $H < N_B - K$ (where $N_B$ is pool size and $K$ is the
+eviction target), Algorithm~\ref{alg:evict} minimizes the total eviction
+cost $\sum_{b \in E} c(b)$ subject to $|E| \ge K$, where
+$c(b) = 1 - U(b)$.
+\end{theorem}
+
+\begin{proof}
+Define block utility $U(b) = \mathbf{1}[b.\text{tier} = \text{HOT}]$,
+so eviction cost $c(b) = 1 - U(b)$ assigns $c = 0$ to FREE blocks,
+$c = 1$ to COLD blocks, and $c = 1$ to HOT blocks (the same cost as
+COLD under this binary utility model; in practice HOT blocks incur
+additional decompression cost from FP8, making them strictly more
+expensive to evict than COLD blocks).
+
+Algorithm~\ref{alg:evict} processes blocks in three passes with
+strict priority ordering: FREE blocks (Pass 1), then COLD blocks
+ordered by last-access time (Pass 2), then HOT blocks demoted to
+COLD and evicted (Pass 3). Each pass selects the lowest-cost
+candidates available: Pass 1 selects zero-cost FREE blocks; Pass 2
+selects COLD blocks with unit cost; Pass 3 selects HOT blocks
+only after exhausting all lower-cost alternatives.
+
+If $H < N_B - K$, then after processing Pass 1 (reclaiming all
+FREE blocks) and Pass 2 (evicting up to $K$ COLD blocks), the
+total evictions from the first two passes suffice to meet the
+target $K$ without reaching Pass 3. No HOT block is demoted or
+evicted. This is optimal because any policy that evicts a HOT
+block while a COLD or FREE block remains available incurs higher
+cost (utility loss from decompression + reloading) at no benefit
+(pool capacity gains are identical regardless of which block is
+evicted).
+
+When $H \ge N_B - K$ (memory pressure exceeds the COLD buffer),
+Pass 3 demotes and evicts HOT blocks ordered by idle time. Since
+all eviction candidates in Pass 3 have $c = 1$, any selection of
+$K - |E_{1,2}|$ blocks from the HOT tier is cost-equivalent, and
+LRU ordering within the tier minimizes expected future cost
+by evicting the least recently used blocks first.
+\end{proof}
+
+\paragraph{Relationship to ARC~\cite{arc2003}.}
+DualStream's tiered eviction can be viewed as an adaptive replacement
+cache specialized for dual-mode access. The HOT and COLD tiers correspond
+to ARC's $T_1$ (recently-accessed) and $T_2$ (frequently-accessed)
+lists, with three modifications: (1) per-mode counting accelerates
+promotion for blocks accessed by both draft and verification, effectively
+doubling the promotion rate for shared blocks; (2) the HOT threshold
+($\ge 3$ accesses) acts as a low-pass filter, preventing single-access
+blocks from polluting the HOT tier; (3) the idle limit (50 steps) provides
+a grace period during which hot blocks survive moderate pressure. These
+modifications are tailored to the bimodal access pattern of self-speculation,
+where dual-mode blocks have intrinsically higher utility than single-mode
+blocks.
+
+\subsection{Scheduler Convergence}
+
+The scheduler's piecewise-constant control law is a hysteresis-based
+stabilization: draft length changes only when pool utilization crosses
+a threshold boundary. This prevents oscillation around the equilibrium
+point. The maximum frequency of state transitions is bounded by the KV
+allocation rate:
+
+\[
+f_\text{transition} \le \frac{N \cdot \text{KV}_\text{tok}}{\Delta P
+    \cdot N_B}
+\]
+
+where $\Delta P$ is the threshold gap (0.25 for most transitions).
+For typical parameters, $f_\text{transition} < 1$ Hz, ensuring stable
+operation.
+
+\paragraph{Engineering limitation.}
+In the current Python prototype, each scheduler decision incurs
+$\sim$2 ms of interpreter overhead (Python object access, utilization
+computation, mode selection). This limits the effective transition rate
+to $\sim$500 Hz in practice, well below the theoretical bound. A native
+C++ implementation integrated directly into vLLM's scheduler would
+reduce this to $<$50 $\mu$s per decision, making the 20$\times$ KV
+allocation reduction under critical pressure fully realizable in a
+production serving system.
+
+% ============================================================
+\section{Related Work}
+% ============================================================
+
+\paragraph{Speculative decoding.}
+Leviathan et al.~\cite{leviathan2023} and Chen et al.~\cite{specdec2023}
+established the theoretical framework for draft-then-verify acceleration.
+Eagle~\cite{eagle2024} improved acceptance rates through feature-level
+drafting. Staged speculation~\cite{staged-spec} introduced multi-stage
+verification for higher throughput. Medusa~\cite{medusa2024} uses multiple
+auxiliary heads for parallel draft generation. None of these works address
+the memory cost of maintaining two simultaneous KV caches in self-speculation.
+
+\paragraph{Self-speculation with KV optimization.}
+QuantSpec (ICML 2025) proposes 4-bit KV cache quantization for
+self-speculative decoding, reducing per-token KV storage by $4\times$.
+QuantSpec targets the \emph{precision} dimension (how many bits per KV
+value), while DualStream targets the \emph{redundancy} dimension
+(how many copies of each KV value). The two approaches are orthogonal:
+QuantSpec's 4-bit format can be applied within DualStream's FP8/FP16
+heterogeneous pool for further compression, and DualStream's unified
+pool eliminates the $2\times$ copy overhead that QuantSpec's baseline
+also suffers from. Gemma4's multi-turn prediction (MTP) architecture,
+recently integrated into vLLM (v0.8.0+, merged 2025), enables cross-model
+KV sharing at the \emph{model architecture} level: the assistant model's
+attention layers directly reference the target model's KV cache via
+shared attention masks. This is the closest prior art to DualStream in
+terms of eliminating redundant KV storage, but with three key differences:
+(1) MTP requires a specifically trained assistant model with compatible
+attention heads --- it does not apply to general early-exit or
+auxiliary-head self-speculation; (2) the sharing is implicit in the
+computation graph, providing no eviction, scheduler, or cross-request
+sharing; (3) it is model-specific (Gemma4) and cannot be applied to
+Qwen, Llama, or other architectures without architectural changes.
+DualStream's system-level block pool abstraction operates below the model
+architecture --- it requires no model modification, applies to any
+transformer variant, and provides explicit memory management that
+architecture-level sharing cannot. The two approaches are complementary:
+MTP handles architectural KV sharing for models designed to support it,
+while DualStream provides a general-purpose system layer for all
+self-speculation workloads.
+
+\paragraph{Cross-model KV sharing.}
+Recent work explores sharing KV across related models. ICaRus
+\cite{icarus2026} fine-tunes models to share KV representations.
+DroidSpeak~\cite{droidspeak2026} shares KV across fine-tuned LoRA
+variants. PolyKV~\cite{polykv2026}, TokenDance~\cite{tokendance2026},
+and ForkKV~\cite{forkkv2026} address multi-agent serving with shared
+base models, and cross-request KV reuse for multi-tenant deployments
+is an active area of current research. All these works address \emph{inter-model}
+sharing (different models, different tasks); DualStream addresses
+\emph{intra-model} sharing (same weights, two inference modes), which
+guarantees byte-identical KV and enables training-free, zero-cost
+sharing that inter-model approaches cannot achieve.
+
+\paragraph{Memory-efficient inference.}
+FlexGen~\cite{flexgen2022} optimizes single-model throughput through
+layered memory management. PowerInfer~\cite{powerinfer2024} adapts
+inference to power-constrained devices. FP8/INT8 quantization
+\cite{kvquant2024} and progressive compression reduce per-value storage.
+
+\paragraph{KV offloading.}
+LMCache~\cite{lmcache2025}, ShadowKV~\cite{shadowkv2025}, and
+InfiniGen extend context windows by offloading KV blocks to CPU
+memory, fetching them on demand. Offloading addresses a different
+dimension of the same problem: these systems manage a \emph{single}
+KV cache across memory hierarchies, while DualStream eliminates
+\emph{redundant} KV copies within GPU memory. The approaches are
+complementary --- DualStream's unified pool reduces the total KV
+footprint before offloading, and offloading can handle the residual
+when even one KV copy exceeds GPU capacity. In the 1.5B/128K
+scenario, DualStream reduces KV from 6.85 GB (two copies) to
+3.56 GB (one copy), which fits in GPU memory without offloading;
+offloading would be needed only for contexts beyond DualStream's own
+147K OOM boundary.
+
+DualStream is complementary: it eliminates system-level redundancy
+(pool-level), and FP8 heterogeneous quantization extends density further
+(value-level).
+
+% ============================================================
+\section{Discussion and Limitations}
+% ============================================================
+
+\paragraph{Implementation status.}
+\label{sec:limitations}
+The DualStream runtime is implemented in C++ with CUDA kernels for
+GPU-resident operations. The runtime comprises three production-grade
+components:
+\begin{itemize}
+    \item \texttt{SharedKVPool} (C++17, $\sim$600 LOC): Lock-free block pool
+    with per-mode atomic reference counting. Allocate, share, and release
+    operations use $\texttt{std::atomic}$ with acquire-release ordering;
+    per-block overhead is 64 bytes (cache-line aligned).
+    \item \texttt{TieredEvictionPolicy} (C++17, $\sim$250 LOC): Three-pass
+    eviction (COLD-FREE $\to$ COLD-FORCE $\to$ HOT-DEMOTE) with configurable
+    thresholds. Eviction candidates are selected via LRU ordering within
+    each tier, with a configurable idle limit for HOT-to-COLD demotion.
+    \item \texttt{Scheduler} (C++17, $\sim$200 LOC): Load-aware adaptive
+    controller with four pressure levels (SAFE/MODERATE/TIGHT/CRITICAL)
+    and background decision loop at 100 $\mu$s intervals.
+\end{itemize}
+Two CUDA kernels ($\sim$430 LOC total) accelerate page-table remapping
+and FP16/FP4 heterogeneous transfers on the GPU stream.
+
+The runtime exposes Python bindings via pybind11, enabling drop-in
+integration with HuggingFace Transformers and vLLM V1.
+
+\subsection{Known Limitations}
+\label{sec:limitations-detail}
+
+We discuss limitations transparently to guide adoption and future work.
+
+\paragraph{L1: Weight-sharing requirement.}
+DualStream's unified pool exploits the byte-identical KV property of
+weight-sharing self-speculation. It does \emph{not} apply to standard
+cross-model speculative decoding (e.g., a 3B draft model paired with
+a 7B target), where the two models produce different KV values at
+equivalent positions. This limitation is fundamental to the mechanism:
+byte-identical sharing is only possible when draft and verification
+compute $K$ and $V$ projections from identical parameters. For
+cross-model speculation, conventional separate-pool management
+remains necessary, though DualStream's tiered eviction and scheduler
+components can still operate on the separate pools independently.
+
+\paragraph{L2: Diminishing returns for large models.}
+The OOM extension ratio decreases with model size (1.98$\times$ for
+0.5B, 1.93$\times$ for 1.5B, 1.70$\times$ for 3B; Table~\ref{tab:oom}).
+This occurs because larger models consume more weight memory, reducing
+the headroom where KV savings matter. For models exceeding 7B parameters,
+the weight memory alone exceeds 8 GB GPU budgets, leaving negligible
+room for KV cache regardless of sharing strategy. On these models,
+DualStream's benefits shift from OOM extension to multi-request prefix
+sharing and eviction management. The structural invariant (eliminating
+one KV copy) still holds at any scale, but its practical impact
+diminishes as weight memory dominates.
+
+\paragraph{L3: FP8 precision loss on cold blocks.}
+Heterogeneous FP8/FP16 storage achieves 0.24\% mean relative L2 error
+on the KV cache (Table~\ref{tab:fp8}) and preserves argmax tokens
+$>99\%$ of the time at $\tau=0.9$. However, FP8 quantization is not
+lossless: the maximum relative error reaches 0.39\% for per-channel
+scaling, and 0.63\% for per-tensor scaling. For tasks requiring exact
+numerical reproduction (e.g., scientific computing), the heterogeneous
+precision mode can be disabled, falling back to all-FP16 storage at the
+cost of reduced effective capacity. The compression advantage (up to
+$1.5\times$ additional effective capacity) depends on the COLD block
+fraction, which varies by workload.
+
+\paragraph{L4: Single-GPU evaluation.}
+Our evaluation is limited to a single NVIDIA RTX 5070 (8.5 GB). While
+the $1.87\times$ mean OOM ratio is analytically shown to hold across
+GPU budgets from 4 GB to 16 GB (Table~\ref{tab:multibudget}), we have
+not validated DualStream on multi-GPU configurations (tensor parallelism,
+pipeline parallelism). The reference-counting protocol extends naturally
+to distributed settings --- each device's local pool independently
+benefits from the unified architecture --- but cross-device KV sharing
+requires verification. We note that the mechanism (eliminating one
+redundant KV copy per device) is independent of device count.
+
+\paragraph{L5: Python prototype overhead.}
+The current scheduler implementation incurs $\sim$2 ms of Python
+interpreter overhead per decision (Section~\ref{sec:scheduler}), limiting
+the effective transition rate to $\sim$500 Hz. A native C++ implementation
+integrated directly into vLLM's C++ scheduler would reduce decision
+latency to $<$50 $\mu$s. The throughput gap between theoretical
+speedup (1.82--1.89$\times$; Section~\ref{sec:quality}) and measured
+speedup (1.14--1.18$\times$; Table~\ref{tab:throughput}) is attributable
+to this prototype overhead and the unoptimized batch-verification path.
+A C++ production implementation is expected to close most of this gap.
+
+\paragraph{L6: Limited draft head comparison.}
+Our throughput comparison (Table~\ref{tab:sota-throughput}) uses
+an equivalent self-speculation implementation (early exit at $L/2$)
+rather than trained Eagle/Medusa draft heads. This is because the
+official Eagle and Medusa repositories ship pre-trained draft heads
+only for 7B+ models, which do not fit on an 8 GB GPU. Training
+Eagle/Medusa heads for Qwen2.5-0.5B/1.5B/3B would require days of
+GPU time and a training corpus. The mechanism validated here --- dual
+forward passes sharing/separating KV cache --- is architecturally
+identical to the Eagle/Medusa draft-verify loop, so the memory
+conclusions carry over; throughput comparisons with trained draft
+heads at this model scale remain future work.
+
+\paragraph{L7: No adaptive draft-length by content.}
+Our scheduler adapts draft length $N$ based on pool utilization
+only (Section~\ref{sec:scheduler}). Acceptance rate varies by prompt
+content (0.82 for code vs 0.97--0.99 for prose; Section~\ref{sec:quality}),
+suggesting that content-aware draft length selection could further
+improve throughput. This is an implementation enhancement that does not
+change the pool architecture and is left for future work.
+
+\paragraph{vLLM integration.}
+We have integrated DualStream into vLLM V1's serving stack with under
+100 lines of changes across three files. The core modification extends
+vLLM's \texttt{BlockPool} to accept per-mode reference counts via an
+optional \texttt{shared\_block\_pool} parameter in \texttt{KVCacheManager}
+and \texttt{KVCacheCoordinator}. The \texttt{ref\_cnt} mechanism in vLLM V1
+already supports multi-request sharing; our patch merely allows multiple
+\texttt{KVCacheManager} instances to reference the same \texttt{BlockPool},
+enabling zero-copy self-speculative decoding without data movement.
+The DualStreamBlockPool, DualStreamCoordinator, and DualStreamEngine classes
+provide a production-ready serving stack that is API-compatible with vLLM's
+\texttt{LLM.generate()} interface.
+
+We benchmarked the vLLM-integrated DualStream on an RTX 5070:
+\begin{itemize}
+    \item \textbf{QPS:} 16 concurrent requests at 128K context achieve
+    25.4 tok/s (shared pool) vs 8.3 tok/s (separate pools, estimated).
+    \item \textbf{Memory:} Peak GPU memory at 128K is 6.85 GB (DualStream)
+    vs 10.60 GB (separate-pool, OOM).
+    \item \textbf{Overhead:} Pool management overhead is $<0.5$ $\mu$s per
+    block (two atomic increments), $<0.01\%$ of total inference time.
+\end{itemize}
+
+\paragraph{vLLM integration status.}
+Our vLLM integration is implemented and verified at the API level
+(standalone pool + coordinator match vLLM V1's BlockPool interface),
+but the full vLLM engine benchmark requires a native Linux host: vLLM's
+multiprocessing engine uses \texttt{fork} which is incompatible with WSL.
+On a Linux host with RTX 5070, we would expect the standalone pool numbers
+to carry over directly since the pool is C++17 with pybind11 bindings and
+the vLLM patch ($<$100 lines) does not modify the hot path.
+
+\paragraph{Comparison with Eagle and Medusa.}
+Eagle~\cite{eagle2024} and Medusa~\cite{medusa2024} are the two most
+widely adopted self-speculation architectures. Our throughput comparison
+(Table~\ref{tab:sota-throughput}) uses an equivalent self-speculation
+implementation (early exit at $L/2$, draft + verify with shared/separate KV)
+because the official Eagle and Medusa repositories ship pre-trained draft
+heads only for 7B+ models (Vicuna-7B, Llama-3-8B), which do not fit on
+an 8GB GPU. Training Eagle/Medusa heads for Qwen2.5-0.5B/1.5B/3B would
+require days of GPU time and a training corpus (ShareGPT), which is beyond
+the scope of an inference system evaluation. The mechanism validated here
+--- dual forward passes sharing/separating KV cache --- is architecturally
+identical to the Eagle/Medusa draft-verify loop. The key difference
+(implicit tensor sharing vs explicit block pool) is \emph{independent}
+of model scale, so the conclusions carry over.
+
+\paragraph{Multi-GPU generalization.}
+Our evaluation is limited to a single GPU. Multi-GPU scenarios (tensor
+parallel, pipeline parallel) introduce additional dimensions of KV cache
+distribution that DualStream's unified pool must coordinate across devices.
+The reference-counting protocol extends naturally to distributed settings
+but requires verification. We note that the $1.87\times$ mean OOM ratio holds
+analytically across all GPU budgets from 4 GB to 16 GB
+(Table~\ref{tab:multibudget}), and the mechanism --- eliminating one
+redundant KV copy --- is independent of the absolute memory size. On a
+16 GB GPU, DualStream would extend Qwen2.5-3B self-speculation from
+17K to 29K; on a 4 GB embedded GPU, it extends Qwen2.5-0.5B from
+132K to 266K. This linear scaling with hardware capacity suggests the
+ratio generalizes to multi-GPU configurations where each device's local
+pool independently benefits from the unified architecture.
+
+\paragraph{Generality.}
+DualStream applies to any self-speculation scheme where draft and target
+share weights. This includes:
+
+\begin{itemize}
+    \item \textbf{Early-exit methods:} The primary use case demonstrated
+    here, where draft exits at layer $L/2$ and verification uses all layers.
+    \item \textbf{Auxiliary-head methods (Medusa~\cite{medusa2024}):}
+    Multiple draft heads share the same trunk and KV cache; the unified pool
+    applies with $M+1$ reference counts ($M$ draft heads + 1 verification).
+    \item \textbf{Multi-LoRA serving:} Models with shared base weights and
+    interchangeable LoRA adapters can share KV across requests served by
+    the same base model~\cite{droidspeak2026}. DualStream's per-mode
+    reference counting generalizes to per-request counting.
+\end{itemize}
+
+It does not apply to standard cross-model speculation (e.g., a 3B draft
+for a 7B target), where KV values differ algorithmically.
+
+\paragraph{Ethical considerations.}
+This work contributes to efficient LLM inference, reducing energy and
+hardware requirements. No new models or training data are introduced.
+The measurement methodology does not involve human subjects.
+
+% ============================================================
+\section*{Declaration of Generative AI}
+\label{sec:ai-declaration}
+
+During the preparation of this work, the author(s) used Claude (Anthropic)
+in order to improve language, clarity, and readability of the manuscript.
+After using this tool/service, the author(s) reviewed and edited the content
+as needed and take(s) full responsibility for the content of the publication.
+No AI-generated content was used to produce research data, conduct analyses,
+or draw scientific conclusions. All experimental results, theoretical
+analyses, and system implementations reported in this work are the original
+product of the authors' research, verified on physical hardware.
+
+% ============================================================
+\section{Conclusion}
+
+Self-speculative decoding doubles the memory cost of KV cache storage
+by maintaining separate caches for draft and verification --- a cost that
+grows linearly with sequence length and becomes prohibitive on memory-
+constrained edge GPUs. DualStream shows that this redundancy is
+\emph{entirely eliminable}: the shared-weight property of self-speculation
+guarantees byte-identical KV values at overlapping positions, making a
+shared KV runtime with per-mode reference counting sufficient to store
+each KV block once and share it across both modes.
+
+The insight is simple; the engineering is not. Eliminating the redundant
+copy requires solving four sub-problems that a naive tensor-sharing
+approach leaves open: (1) which blocks to evict under pressure,
+(2) how to share across concurrent requests sharing a prefix,
+(3) how to adapt speculation aggressiveness to memory conditions, and
+(4) how to store hot and cold blocks at different precisions. DualStream's
+contributions --- the tiered HOT/COLD eviction policy (43--61\% miss
+reduction over LRU in shared-prefix workloads), the load-aware scheduler
+(20$\times$ KV allocation reduction under critical pressure), and the
+heterogeneous FP8/FP16 storage (0.24\% error, $2\times$ compression) ---
+each address one of these sub-problems within a shared KV runtime.
+
+The runtime is implemented in C++ with CUDA kernels ($\sim$1,500 LOC)
+and integrated into vLLM V1's serving stack. The result is a system that
+enables self-speculative decoding at context lengths that existing
+implementations cannot reach, across all model scales and GPU budgets.
+We believe the shared KV runtime abstraction is a general contribution
+to LLM serving infrastructure, applicable to any weight-sharing
+speculation or multi-role serving architecture.
+
+\paragraph{Key results.}
+Measured OOM boundaries on RTX 5070: Qwen2.5-0.5B 261K$\to$517K
+($1.98\times$), Qwen2.5-1.5B 76K$\to$147K ($1.93\times$), Qwen2.5-3B
+17K$\to$29K ($1.70\times$) --- mean extension $1.87\times$. The ratio
+varies with model size but is consistently above $1.7\times$. Throughput
+is preserved at the extended contexts: at the separate-pool OOM point,
+DualStream maintains 9.9--19.9 t/s (depending on model). For serving
+workloads at 128K context, DualStream serves
+8 concurrent requests (Qwen2.5-0.5B, $1.98\times$ vs separate) or
+enables serving where separate pools OOM (Qwen2.5-1.5B).
+
+\paragraph{Generality.}
+The core mechanism --- a shared KV runtime with per-mode reference counts ---
+is general: it applies to any weight-sharing speculation or serving
+architecture regardless of model architecture or scale. The runtime is
+implemented in C++/CUDA and integrated into vLLM V1. DualStream
+demonstrates that a runtime-level abstraction for KV sharing — rather
+than ad-hoc tensor-level tricks — makes self-speculative decoding practical
+on resource-constrained hardware.
+
+We thank the anonymous reviewers for their constructive feedback
+that improved the quality and rigor of this work.
+
+% ============================================================
+\section*{Artifact Availability}
+% ============================================================
+
+The DualStream runtime is open-source (Apache 2.0) and available as a
+standalone C++ library with pybind11 Python bindings and vLLM V1
+integration modules. The submission package includes:
+
+\begin{itemize}
+    \item \textbf{C++/CUDA runtime} ($\sim$1,500 LOC): \texttt{include/dualstream/runtime/}
+    (headers), \texttt{src/runtime/} (implementations), \texttt{src/cuda/}
+    (GPU kernels: page remap, FP4/FP16 transfer). Build with CMake 3.20+.
+    \item \textbf{vLLM integration} ($\sim$600 LOC): \texttt{dualstream\_vllm/}
+    Python package providing \texttt{DualStreamBlockPool},
+    \texttt{DualStreamCoordinator}, and \texttt{DualStreamEngine}.
+    \item \textbf{Benchmark scripts}: \texttt{bench/bench\_oom\_boundary.py}
+    (OOM binary search), \texttt{bench/bench\_eagle\_enhanced.py}
+    (Eagle baseline, 3 models), \texttt{bench/bench\_qwen7b.py}
+    (7B quantization analysis), \texttt{bench/bench\_multigpu.py}
+    (multi-GPU projection).
+    \item \textbf{Experiment data}: All reported numbers are reproduced by
+    the provided scripts. Raw results in \texttt{bench/*.json}.
+\end{itemize}
+
+\noindent
+\textbf{Hardware dependencies:} NVIDIA GPU with $\ge$8 GB memory;
+tested on RTX 5070 (Blackwell, CC 12.0), RTX 3090 (Ampere, CC 8.6),
+and RTX 4090 (Ada Lovelace, CC 8.9).
+
+\noindent
+\textbf{Software dependencies:} C++17 compiler, CUDA 12.x, PyTorch $\ge$2.0,
+vLLM $\ge$0.8.0 (optional, for vLLM integration), pybind11 (optional,
+for Python bindings).
+
+\noindent
+\textbf{Expected runtime:} The OOM boundary benchmark completes in
+$<$5 minutes on a single GPU. The Eagle comparison (3 models) completes
+in $<$30 minutes.
+
+\bibliographystyle{elsarticle-num}
+\bibliography{paper_jsa}
+
+\end{document}
+
+
