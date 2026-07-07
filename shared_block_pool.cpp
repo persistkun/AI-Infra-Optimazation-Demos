@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <random>
+#include <stdatomic.h>
 
 // ============================================================
 // DualStream Phase 2: SharedBlockPool
@@ -90,7 +91,7 @@ struct PhysicalBlock {
     
     // 模型元数据
     ModelID         owner_id;        // 谁分配了这块
-    AccessMode      access_mode;
+    std::atomic<AccessMode> access_mode;
     bool            dirty;
     
     // 频率感知
@@ -124,9 +125,7 @@ public:
     // 读检查: fast path, 不阻塞
     static bool can_read(const PhysicalBlock& block) {
         // memory_order_acquire 保证看到最新的 access_mode
-        AccessMode mode = static_cast<AccessMode>(
-            __atomic_load_n(reinterpret_cast<const uint8_t*>(&block.access_mode),
-                            __ATOMIC_ACQUIRE));
+        AccessMode mode = block.access_mode.load(std::memory_order_acquire);
         return mode == AccessMode::SHARED_READ || 
                mode == AccessMode::FREE ||
                mode == AccessMode::EVICT_PENDING;  // 待回收时仍可读
@@ -135,13 +134,12 @@ public:
     // 写准备: 标记 pending, 等待 grace period
     static bool prepare_write(PhysicalBlock& block) {
         AccessMode expected = AccessMode::SHARED_READ;
-        uint8_t* target = reinterpret_cast<uint8_t*>(&block.access_mode);
-        uint8_t desired = static_cast<uint8_t>(AccessMode::EVICT_PENDING);
+        AccessMode desired = AccessMode::EVICT_PENDING;
         
         // CAS: 只有 SHARED_READ 状态才能进入写准备
-        if (__atomic_compare_exchange_n(target, 
-                reinterpret_cast<uint8_t*>(&expected), desired,
-                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (block.access_mode.compare_exchange_strong(
+                expected, desired,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
             // 等待 grace period
             std::this_thread::sleep_for(
                 std::chrono::microseconds(GRACE_PERIOD_US));
@@ -152,16 +150,12 @@ public:
 
     // 写完成: 回到共享读状态
     static void finish_write(PhysicalBlock& block) {
-        __atomic_store_n(reinterpret_cast<uint8_t*>(&block.access_mode),
-                         static_cast<uint8_t>(AccessMode::SHARED_READ),
-                         __ATOMIC_RELEASE);
+        block.access_mode.store(AccessMode::SHARED_READ, std::memory_order_release);
     }
 
     // 检查是否在写保护期
     static bool is_write_protected(const PhysicalBlock& block) {
-        return static_cast<AccessMode>(
-            __atomic_load_n(reinterpret_cast<const uint8_t*>(&block.access_mode),
-                            __ATOMIC_RELAXED)) == AccessMode::COW_PENDING;
+        return block.access_mode.load(std::memory_order_relaxed) == AccessMode::COW_PENDING;
     }
 };
 
